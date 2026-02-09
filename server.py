@@ -3,7 +3,7 @@ import logging
 from typing import Any, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("zeppelin-mcp")
@@ -62,14 +62,28 @@ zeppelin = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWOR
 
 
 @mcp.tool()
-async def list_notebooks(ctx: Context) -> str:
-    """List all notebooks on the Zeppelin server."""
+async def list_notebooks(name_filter: Optional[str] = None) -> str:
+    """List notebooks on the Zeppelin server.
+
+    Args:
+        name_filter: Optional substring filter (case-insensitive). When provided, only
+            notebooks whose full path contains this string are returned. Matches against
+            the full path.
+    """
     try:
         data = await zeppelin.request("GET", "/api/notebook")
         if data.get("status") != "OK":
             return f"Error: {data.get('message', 'Unknown error')}"
         notebooks = data.get("body", [])
+        if name_filter:
+            lower_filter = name_filter.lower()
+            notebooks = [
+                nb for nb in notebooks
+                if lower_filter in nb.get("path", nb.get("name", "")).lower()
+            ]
         if not notebooks:
+            if name_filter:
+                return f"No notebooks matching '{name_filter}'."
             return "No notebooks found."
         lines = [f"- {nb.get('id', 'N/A')}: {nb.get('path', nb.get('name', 'N/A'))}" for nb in notebooks]
         return f"Found {len(notebooks)} notebooks:\n" + "\n".join(lines)
@@ -93,11 +107,19 @@ async def search_notebooks(query: str) -> str:
             return f"No results found for '{query}'."
         lines = []
         for r in results:
+            # Extract notebook_id and paragraph_id from compound id
+            # Format: "noteId/paragraph/paragraphId" or just a plain id
+            raw_id = r.get("id", "")
+            parts = raw_id.split("/paragraph/")
+            notebook_id = parts[0] if parts else "N/A"
+            paragraph_id = parts[1] if len(parts) > 1 else "N/A"
+
+            notebook_name = r.get("name", r.get("notebookName", "N/A"))
             header = r.get("header", "")
             snippet = r.get("snippet", "").replace("\n", " ")[:200]
             lines.append(
-                f"- Notebook: {r.get('notebookName', 'N/A')} | "
-                f"Paragraph: {r.get('id', 'N/A')} | "
+                f"- Notebook: {notebook_name} (id: {notebook_id}) | "
+                f"Paragraph: {paragraph_id} | "
                 f"Header: {header} | "
                 f"Snippet: {snippet}"
             )
@@ -109,6 +131,10 @@ async def search_notebooks(query: str) -> str:
 @mcp.tool()
 async def get_notebook(notebook_id: str) -> str:
     """Get full notebook details including all paragraphs and their content.
+
+    Note: This returns ALL paragraph code and output, which can be very large.
+    Consider using list_paragraphs (metadata only) + get_paragraph (single paragraph)
+    for a much lighter alternative when you don't need the entire notebook.
 
     Args:
         notebook_id: The notebook ID to retrieve
@@ -140,6 +166,82 @@ async def get_notebook(notebook_id: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error getting notebook: {e}"
+
+
+@mcp.tool()
+async def list_paragraphs(notebook_id: str) -> str:
+    """List paragraph metadata (index, id, title, status) without code or output.
+
+    Use this instead of get_notebook when you only need to find paragraph positions
+    or IDs. Much lighter — returns only metadata, no code or execution output.
+
+    Args:
+        notebook_id: The notebook ID to list paragraphs for
+    """
+    try:
+        data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
+        if data.get("status") != "OK":
+            return f"Error: {data.get('message', 'Unknown error')}"
+        nb = data.get("body", {})
+        paragraphs = nb.get("paragraphs", [])
+        lines = [f"Notebook: {nb.get('name', 'N/A')} (id: {nb.get('id', notebook_id)})"]
+        lines.append(f"Total paragraphs: {len(paragraphs)}")
+        lines.append("")
+        for i, p in enumerate(paragraphs):
+            title = p.get("title", "")
+            status = p.get("status", "UNKNOWN")
+            pid = p.get("id", "N/A")
+            if title:
+                label = title
+            else:
+                text = p.get("text", "")
+                first_line = text.split("\n", 1)[0] if text else ""
+                if len(first_line) > 60:
+                    first_line = first_line[:60] + "..."
+                label = f'"{first_line}"' if first_line else "(empty)"
+            lines.append(f"[{i}] {pid} - {label} (status: {status})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing paragraphs: {e}"
+
+
+@mcp.tool()
+async def get_paragraph(notebook_id: str, paragraph_id: str) -> str:
+    """Get full content of a single paragraph (code and output).
+
+    Use this to inspect a specific paragraph without loading the entire notebook.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to retrieve
+    """
+    try:
+        data = await zeppelin.request(
+            "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+        )
+        if data.get("status") != "OK":
+            return f"Error: {data.get('message', 'Unknown error')}"
+        p = data.get("body", {})
+        title = p.get("title", "")
+        text = p.get("text", "")
+        status = p.get("status", "UNKNOWN")
+        pid = p.get("id", paragraph_id)
+
+        lines = [f"Paragraph: {pid}"]
+        if title:
+            lines.append(f"Title: {title}")
+        lines.append(f"Status: {status}")
+        if text:
+            lines.append(f"Code:\n{_indent(text, 2)}")
+        results = p.get("results", {})
+        if results and results.get("msg"):
+            for msg in results["msg"]:
+                msg_data = msg.get("data", "").strip()
+                if msg_data:
+                    lines.append(f"Output ({msg.get('type', 'TEXT')}):\n{_indent(msg_data, 2)}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting paragraph: {e}"
 
 
 def _indent(text: str, spaces: int) -> str:
