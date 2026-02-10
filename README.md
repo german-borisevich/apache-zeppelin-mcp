@@ -60,7 +60,9 @@ Replace `/ABSOLUTE/PATH/TO/apache-zeppelin-mcp` with the actual absolute path to
 
 ## Setup for Claude Code
 
-Run the following command to register the server:
+### Global (all sessions)
+
+Run the following command to register the server for every Claude Code session:
 
 ```bash
 claude mcp add zeppelin \
@@ -83,6 +85,35 @@ To remove it later:
 ```bash
 claude mcp remove zeppelin
 ```
+
+### Project-scoped (single project only)
+
+To make the server available only when Claude Code is running inside a specific project, add a `.mcp.json` file to the project root:
+
+```json
+{
+  "mcpServers": {
+    "zeppelin": {
+      "command": "uv",
+      "args": [
+        "--directory", "/ABSOLUTE/PATH/TO/apache-zeppelin-mcp",
+        "run", "server.py"
+      ],
+      "env": {
+        "ZEPPELIN_BASE_URL": "http://your-zeppelin-host:8080",
+        "ZEPPELIN_USERNAME": "your-username",
+        "ZEPPELIN_PASSWORD": "your-password"
+      }
+    }
+  }
+}
+```
+
+Replace the URL, credentials, and path with your actual values.
+
+The server will only be loaded when Claude Code is started from that project directory (or a subdirectory). Other projects and global sessions will not see the Zeppelin tools.
+
+> **Tip:** If `.mcp.json` contains credentials you don't want to commit, add it to your `.gitignore`.
 
 ## Verifying the Connection
 
