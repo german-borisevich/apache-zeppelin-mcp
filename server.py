@@ -328,6 +328,65 @@ async def update_paragraph_forms(
         return f"Error updating paragraph forms: {e}"
 
 
+@mcp.tool()
+async def update_paragraph_config(
+    notebook_id: str,
+    paragraph_id: str,
+    config: dict[str, Any],
+) -> str:
+    """Update paragraph visualization/chart config (graph type, column mappings, display settings).
+
+    Uses the dedicated config endpoint which supports partial updates — only the
+    keys you provide are changed, the rest are preserved.
+
+    Common config fields:
+      - graph.mode: "table", "multiBarChart", "stackedAreaChart", "lineChart",
+          "pieChart", "scatterChart"
+      - graph.keys: list of key column mappings, e.g. [{"name": "date", "index": 0, "aggr": "sum"}]
+      - graph.groups: list of group column mappings, e.g. [{"name": "category", "index": 1, "aggr": "sum"}]
+      - graph.values: list of value column mappings, e.g. [{"name": "revenue", "index": 2, "aggr": "sum"}]
+          Supported aggr values: "sum", "count", "avg", "min", "max"
+      - graph.setting.multiBarChart (or lineChart, etc.): chart-specific options
+      - colWidth: paragraph width in the grid (1–12)
+      - enabled: whether the paragraph is enabled (true/false)
+
+    Example config for a line chart with date as key, offer_group as group, arppu as value:
+        {
+            "graph": {
+                "mode": "lineChart",
+                "keys": [{"name": "date", "index": 0, "aggr": "sum"}],
+                "groups": [{"name": "offer_group", "index": 1, "aggr": "sum"}],
+                "values": [{"name": "arppu", "index": 2, "aggr": "sum"}]
+            }
+        }
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to configure
+        config: Dict of config fields to set or update. Merged with existing config.
+    """
+    try:
+        await zeppelin.request(
+            "PUT",
+            f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+            json=config,
+        )
+        graph = config.get("graph", {})
+        mode = graph.get("mode")
+        parts = [f"Updated config for paragraph {paragraph_id}"]
+        if mode:
+            parts.append(f"chart type: {mode}")
+        if graph.get("keys"):
+            parts.append(f"keys: {[k['name'] for k in graph['keys']]}")
+        if graph.get("groups"):
+            parts.append(f"groups: {[g['name'] for g in graph['groups']]}")
+        if graph.get("values"):
+            parts.append(f"values: {[v['name'] for v in graph['values']]}")
+        return ". ".join(parts) + "."
+    except Exception as e:
+        return f"Error updating paragraph config: {e}"
+
+
 def _format_forms(paragraph: dict) -> list[str]:
     """Extract dynamic form definitions and current values from a paragraph."""
     settings = paragraph.get("settings", {})
