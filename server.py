@@ -156,6 +156,10 @@ async def get_notebook(notebook_id: str) -> str:
             lines.append(f"[{i}] Paragraph {p.get('id', 'N/A')}{title_str} (status: {status})")
             if text:
                 lines.append(f"    Code:\n{_indent(text, 6)}")
+            form_lines = _format_forms(p)
+            if form_lines:
+                for fl in form_lines:
+                    lines.append(f"    {fl}")
             results = p.get("results", {})
             if results and results.get("msg"):
                 for msg in results["msg"]:
@@ -207,9 +211,11 @@ async def list_paragraphs(notebook_id: str) -> str:
 
 @mcp.tool()
 async def get_paragraph(notebook_id: str, paragraph_id: str) -> str:
-    """Get full content of a single paragraph (code and output).
+    """Get full content of a single paragraph (code, output, and dynamic forms).
 
     Use this to inspect a specific paragraph without loading the entire notebook.
+    If the paragraph contains dynamic forms, their definitions and current values
+    are included in the response.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
@@ -233,6 +239,7 @@ async def get_paragraph(notebook_id: str, paragraph_id: str) -> str:
         lines.append(f"Status: {status}")
         if text:
             lines.append(f"Code:\n{_indent(text, 2)}")
+        lines.extend(_format_forms(p))
         results = p.get("results", {})
         if results and results.get("msg"):
             for msg in results["msg"]:
@@ -242,6 +249,63 @@ async def get_paragraph(notebook_id: str, paragraph_id: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error getting paragraph: {e}"
+
+
+@mcp.tool()
+async def get_paragraph_forms(notebook_id: str, paragraph_id: str) -> str:
+    """Get dynamic form definitions and current parameter values for a paragraph.
+
+    Returns the form fields (name, type, default, options) and their current values.
+    Use this to discover what parameters a paragraph accepts before calling
+    run_paragraph with params.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to inspect
+    """
+    try:
+        data = await zeppelin.request(
+            "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+        )
+        if data.get("status") != "OK":
+            return f"Error: {data.get('message', 'Unknown error')}"
+        p = data.get("body", {})
+        form_lines = _format_forms(p)
+        if not form_lines:
+            return f"Paragraph {paragraph_id} has no dynamic forms."
+        return "\n".join(form_lines)
+    except Exception as e:
+        return f"Error getting paragraph forms: {e}"
+
+
+def _format_forms(paragraph: dict) -> list[str]:
+    """Extract dynamic form definitions and current values from a paragraph."""
+    settings = paragraph.get("settings", {})
+    forms = settings.get("forms", {})
+    params = settings.get("params", {})
+    if not forms and not params:
+        return []
+    lines: list[str] = []
+    if forms:
+        lines.append("Dynamic forms:")
+        for name, form in forms.items():
+            form_type = form.get("type", "unknown")
+            default = form.get("defaultValue", "")
+            current = params.get(name, default)
+            entry = f"  - {name} (type: {form_type}, default: {default!r}, current: {current!r})"
+            options = form.get("options", [])
+            if options:
+                option_strs = [
+                    f"{o.get('value', '')} ({o.get('displayName', o.get('value', ''))})"
+                    for o in options
+                ]
+                entry += f" options: [{', '.join(option_strs)}]"
+            lines.append(entry)
+    elif params:
+        lines.append("Form parameters:")
+        for name, value in params.items():
+            lines.append(f"  - {name}: {value!r}")
+    return lines
 
 
 def _indent(text: str, spaces: int) -> str:
@@ -297,23 +361,35 @@ async def add_paragraph(
 
 
 @mcp.tool()
-async def run_paragraph(notebook_id: str, paragraph_id: str) -> str:
+async def run_paragraph(
+    notebook_id: str,
+    paragraph_id: str,
+    params: Optional[dict[str, Any]] = None,
+) -> str:
     """Run a paragraph synchronously and return the result.
+
+    Supports dynamic forms — pass params to set form values before execution.
+    Use get_paragraph to discover available form fields and their current values.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to run
+        params: Optional dict of dynamic form values, e.g. {"city": "Seoul", "limit": "10"}.
+            Keys must match the form field names defined in the paragraph.
     """
     try:
+        body: dict[str, Any] | None = None
+        if params:
+            body = {"params": params}
         data = await zeppelin.request(
-            "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}"
+            "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}", json=body
         )
         if data.get("status") != "OK":
             return f"Error: {data.get('message', 'Unknown error')}"
-        body = data.get("body", {})
-        code = body.get("code", "UNKNOWN")
+        resp_body = data.get("body", {})
+        code = resp_body.get("code", "UNKNOWN")
         lines = [f"Status: {code}"]
-        msgs = body.get("msg", [])
+        msgs = resp_body.get("msg", [])
         for msg in msgs:
             msg_data = msg.get("data", "").strip()
             if msg_data:
@@ -324,15 +400,26 @@ async def run_paragraph(notebook_id: str, paragraph_id: str) -> str:
 
 
 @mcp.tool()
-async def run_all_paragraphs(notebook_id: str) -> str:
+async def run_all_paragraphs(
+    notebook_id: str,
+    params: Optional[dict[str, Any]] = None,
+) -> str:
     """Run all paragraphs in a notebook asynchronously.
+
+    Supports dynamic forms — pass params to set form values for the entire notebook
+    before execution. This is useful for note-scoped forms shared across paragraphs.
 
     Args:
         notebook_id: The notebook ID to run
+        params: Optional dict of dynamic form values, e.g. {"city": "Seoul", "limit": "10"}.
+            Keys must match the form field names defined in the notebook.
     """
     try:
+        body: dict[str, Any] | None = None
+        if params:
+            body = {"params": params}
         data = await zeppelin.request(
-            "POST", f"/api/notebook/job/{notebook_id}"
+            "POST", f"/api/notebook/job/{notebook_id}", json=body
         )
         if data.get("status") != "OK":
             return f"Error: {data.get('message', 'Unknown error')}"
