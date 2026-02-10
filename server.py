@@ -1,3 +1,4 @@
+import asyncio
 import os
 import logging
 from typing import Any, Optional
@@ -278,6 +279,55 @@ async def get_paragraph_forms(notebook_id: str, paragraph_id: str) -> str:
         return f"Error getting paragraph forms: {e}"
 
 
+@mcp.tool()
+async def update_paragraph_forms(
+    notebook_id: str, paragraph_id: str, params: dict[str, Any]
+) -> str:
+    """Update dynamic form values without re-executing the paragraph.
+
+    This is the safest way to change form parameters when chart/visualization
+    settings must be preserved. Unlike run_paragraph with params, this only
+    updates the stored parameter values — it does not trigger execution.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to update
+        params: Dict of form values to set, e.g. {"city": "Seoul", "limit": "10"}.
+            Keys must match the form field names defined in the paragraph.
+    """
+    try:
+        saved = await _save_paragraph_state(notebook_id, paragraph_id)
+        if saved is None:
+            return f"Error: could not fetch paragraph {paragraph_id}"
+
+        settings = saved.get("settings", {})
+        existing_params = settings.get("params", {})
+        existing_params.update(params)
+        settings["params"] = existing_params
+
+        body: dict[str, Any] = {
+            "text": saved.get("text", ""),
+            "config": saved.get("config", {}),
+            "settings": settings,
+        }
+        title = saved.get("title")
+        if title:
+            body["title"] = title
+
+        await zeppelin.request(
+            "PUT",
+            f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}",
+            json=body,
+        )
+        return (
+            f"Updated form values for paragraph {paragraph_id}: "
+            + ", ".join(f"{k}={v!r}" for k, v in params.items())
+            + ". Paragraph was NOT re-executed."
+        )
+    except Exception as e:
+        return f"Error updating paragraph forms: {e}"
+
+
 def _format_forms(paragraph: dict) -> list[str]:
     """Extract dynamic form definitions and current values from a paragraph."""
     settings = paragraph.get("settings", {})
@@ -311,6 +361,78 @@ def _format_forms(paragraph: dict) -> list[str]:
 def _indent(text: str, spaces: int) -> str:
     prefix = " " * spaces
     return "\n".join(prefix + line for line in text.splitlines())
+
+
+async def _save_paragraph_state(notebook_id: str, paragraph_id: str) -> dict | None:
+    """Fetch paragraph data needed for config save/restore.
+
+    Uses notebook-level GET to ensure the full config (including
+    config.results with visualization column mappings) is captured.
+    """
+    try:
+        data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
+        if data.get("status") != "OK":
+            return None
+        for p in data.get("body", {}).get("paragraphs", []):
+            if p.get("id") == paragraph_id:
+                logger.debug(
+                    "Saved state for paragraph %s, config keys: %s",
+                    paragraph_id, list(p.get("config", {}).keys()),
+                )
+                return p
+        return None
+    except Exception:
+        return None
+
+
+async def _restore_paragraph_config(
+    notebook_id: str, paragraph_id: str, saved: dict
+) -> None:
+    """Restore paragraph config (chart/visualization settings) via the
+    dedicated config endpoint.
+
+    Uses PUT /api/notebook/{noteId}/paragraph/{paragraphId}/config which
+    persists config changes. The generic paragraph PUT endpoint only
+    accepts text and title — it silently ignores config.
+    """
+    try:
+        config = saved.get("config")
+        if not config:
+            return
+        await zeppelin.request(
+            "PUT",
+            f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+            json=config,
+        )
+        logger.debug("Restored config for paragraph %s", paragraph_id)
+    except Exception:
+        logger.warning("Failed to restore config for paragraph %s", paragraph_id)
+
+
+async def _wait_for_notebook_completion(
+    notebook_id: str, timeout: float = 600.0, poll_interval: float = 2.0
+) -> bool:
+    """Poll notebook job status until all paragraphs finish or timeout."""
+    elapsed = 0.0
+    while elapsed < timeout:
+        try:
+            data = await zeppelin.request(
+                "GET", f"/api/notebook/job/{notebook_id}"
+            )
+            if data.get("status") != "OK":
+                return False
+            paragraphs = data.get("body", [])
+            if not paragraphs or not any(
+                p.get("status") in ("RUNNING", "PENDING", "READY")
+                for p in paragraphs
+            ):
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+    logger.warning("Timeout waiting for notebook %s after %.0fs", notebook_id, timeout)
+    return False
 
 
 @mcp.tool()
@@ -371,6 +493,10 @@ async def run_paragraph(
     Supports dynamic forms — pass params to set form values before execution.
     Use get_paragraph to discover available form fields and their current values.
 
+    Chart/visualization settings (config) are automatically saved before
+    execution and restored afterward, because Zeppelin resets the config
+    object on re-execution.
+
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to run
@@ -378,12 +504,19 @@ async def run_paragraph(
             Keys must match the form field names defined in the paragraph.
     """
     try:
+        saved = await _save_paragraph_state(notebook_id, paragraph_id)
+
         body: dict[str, Any] | None = None
         if params:
             body = {"params": params}
         data = await zeppelin.request(
             "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}", json=body
         )
+
+        if saved is not None:
+            await asyncio.sleep(0.5)
+            await _restore_paragraph_config(notebook_id, paragraph_id, saved)
+
         if data.get("status") != "OK":
             return f"Error: {data.get('message', 'Unknown error')}"
         resp_body = data.get("body", {})
@@ -404,10 +537,13 @@ async def run_all_paragraphs(
     notebook_id: str,
     params: Optional[dict[str, Any]] = None,
 ) -> str:
-    """Run all paragraphs in a notebook asynchronously.
+    """Run all paragraphs in a notebook and wait for completion.
 
     Supports dynamic forms — pass params to set form values for the entire notebook
-    before execution. This is useful for note-scoped forms shared across paragraphs.
+    before execution.
+
+    Chart/visualization settings (config) for every paragraph are automatically
+    saved before execution and restored after all paragraphs finish.
 
     Args:
         notebook_id: The notebook ID to run
@@ -415,6 +551,11 @@ async def run_all_paragraphs(
             Keys must match the form field names defined in the notebook.
     """
     try:
+        nb_data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
+        saved_paragraphs: list[dict] = []
+        if nb_data.get("status") == "OK":
+            saved_paragraphs = nb_data.get("body", {}).get("paragraphs", [])
+
         body: dict[str, Any] | None = None
         if params:
             body = {"params": params}
@@ -423,7 +564,21 @@ async def run_all_paragraphs(
         )
         if data.get("status") != "OK":
             return f"Error: {data.get('message', 'Unknown error')}"
-        return f"Triggered execution of all paragraphs in notebook {notebook_id}. Use get_paragraph_status to check progress."
+
+        completed = await _wait_for_notebook_completion(notebook_id)
+
+        restored = 0
+        for p in saved_paragraphs:
+            pid = p.get("id")
+            if pid and p.get("config"):
+                await _restore_paragraph_config(notebook_id, pid, p)
+                restored += 1
+
+        status = "completed" if completed else "timed out"
+        return (
+            f"Execution of all paragraphs in notebook {notebook_id} {status}. "
+            f"Restored chart settings for {restored} paragraphs."
+        )
     except Exception as e:
         return f"Error running all paragraphs: {e}"
 
