@@ -700,12 +700,26 @@ async def get_paragraph_status(notebook_id: str, paragraph_id: str) -> str:
         started = body.get("started", "N/A")
         finished = body.get("finished", "N/A")
         progress = body.get("progress", "N/A")
-        return (
-            f"Status: {status}\n"
-            f"Started: {started}\n"
-            f"Finished: {finished}\n"
-            f"Progress: {progress}"
-        )
+        lines = [
+            f"Status: {status}",
+            f"Started: {started}",
+            f"Finished: {finished}",
+            f"Progress: {progress}",
+        ]
+        if status in ("ERROR", "ABORT"):
+            try:
+                para_data = await zeppelin.request(
+                    "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+                )
+                results = para_data.get("body", {}).get("results", {})
+                if results and results.get("msg"):
+                    for msg in results["msg"]:
+                        msg_data = msg.get("data", "").strip()
+                        if msg_data:
+                            lines.append(f"\nError Output ({msg.get('type', 'TEXT')}):\n  {msg_data}")
+            except Exception:
+                pass
+        return "\n".join(lines)
     except Exception as e:
         return f"Error getting paragraph status: {e}"
 
