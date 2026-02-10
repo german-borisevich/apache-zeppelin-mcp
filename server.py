@@ -336,15 +336,17 @@ async def update_paragraph_config(
 ) -> str:
     """Update paragraph visualization/chart config (graph type, column mappings, display settings).
 
-    Uses the dedicated config endpoint which supports partial updates — only the
-    keys you provide are changed, the rest are preserved.
+    Fetches the current full config and deep-merges the provided changes into it
+    before sending to the API. This ensures existing settings (like results metadata)
+    are preserved and nested graph fields are merged correctly.
 
     Common config fields:
       - graph.mode: "table", "multiBarChart", "stackedAreaChart", "lineChart",
           "pieChart", "scatterChart"
-      - graph.keys: list of key column mappings, e.g. [{"name": "date", "index": 0, "aggr": "sum"}]
-      - graph.groups: list of group column mappings, e.g. [{"name": "category", "index": 1, "aggr": "sum"}]
-      - graph.values: list of value column mappings, e.g. [{"name": "revenue", "index": 2, "aggr": "sum"}]
+      - graph.keys: list of key column mappings, e.g. [{"name": "date"}]
+          "index" and "aggr" are optional — index is auto-detected from results, aggr defaults to "sum"
+      - graph.groups: list of group column mappings, e.g. [{"name": "category"}]
+      - graph.values: list of value column mappings, e.g. [{"name": "revenue"}]
           Supported aggr values: "sum", "count", "avg", "min", "max"
       - graph.setting.multiBarChart (or lineChart, etc.): chart-specific options
       - colWidth: paragraph width in the grid (1–12)
@@ -354,9 +356,9 @@ async def update_paragraph_config(
         {
             "graph": {
                 "mode": "lineChart",
-                "keys": [{"name": "date", "index": 0, "aggr": "sum"}],
-                "groups": [{"name": "offer_group", "index": 1, "aggr": "sum"}],
-                "values": [{"name": "arppu", "index": 2, "aggr": "sum"}]
+                "keys": [{"name": "date"}],
+                "groups": [{"name": "offer_group"}],
+                "values": [{"name": "arppu"}]
             }
         }
 
@@ -366,6 +368,43 @@ async def update_paragraph_config(
         config: Dict of config fields to set or update. Merged with existing config.
     """
     try:
+        saved = await _save_paragraph_state(notebook_id, paragraph_id)
+        if saved:
+            current_config = saved.get("config", {})
+            if "graph" in config:
+                user_graph = config["graph"]
+
+                # Build column name→index mapping from paragraph results
+                col_index_map = {}
+                results_msg = saved.get("results", {}).get("msg", [])
+                if results_msg:
+                    first_msg = results_msg[0].get("data", "")
+                    header_line = first_msg.split("\n", 1)[0]
+                    if header_line:
+                        col_index_map = {name: i for i, name in enumerate(header_line.split("\t"))}
+
+                # Auto-fill missing index/aggr for column entries
+                if col_index_map:
+                    for field in ("keys", "groups", "values"):
+                        for col in user_graph.get(field, []):
+                            if "index" not in col or col["index"] is None:
+                                name = col.get("name", "")
+                                if name in col_index_map:
+                                    col["index"] = col_index_map[name]
+                            if "aggr" not in col:
+                                col["aggr"] = "sum"
+
+                # Merge into top-level graph
+                merged_graph = {**current_config.get("graph", {}), **user_graph}
+                config = {**current_config, **config, "graph": merged_graph}
+                # Propagate graph changes into each results.N.graph
+                results = config.get("results", {})
+                for result_data in results.values():
+                    if isinstance(result_data, dict) and "graph" in result_data:
+                        result_data["graph"] = {**result_data["graph"], **user_graph}
+            else:
+                config = {**current_config, **config}
+
         await zeppelin.request(
             "PUT",
             f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
