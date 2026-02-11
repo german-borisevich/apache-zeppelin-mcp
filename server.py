@@ -2,28 +2,26 @@ import asyncio
 import functools
 import os
 import logging
+import re
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("zeppelin-mcp")
 
-ZEPPELIN_BASE_URL = os.environ.get("ZEPPELIN_BASE_URL")
-ZEPPELIN_USERNAME = os.environ.get("ZEPPELIN_USERNAME")
-ZEPPELIN_PASSWORD = os.environ.get("ZEPPELIN_PASSWORD")
-
-if not ZEPPELIN_BASE_URL:
-    raise ValueError("ZEPPELIN_BASE_URL environment variable is required")
-if not ZEPPELIN_USERNAME:
-    raise ValueError("ZEPPELIN_USERNAME environment variable is required")
-if not ZEPPELIN_PASSWORD:
-    raise ValueError("ZEPPELIN_PASSWORD environment variable is required")
+ZEPPELIN_BASE_URL = os.environ.get("ZEPPELIN_BASE_URL", "")
+ZEPPELIN_USERNAME = os.environ.get("ZEPPELIN_USERNAME", "")
+ZEPPELIN_PASSWORD = os.environ.get("ZEPPELIN_PASSWORD", "")
 
 MAX_OUTPUT_CHARS = int(os.environ.get("ZEPPELIN_MAX_OUTPUT_CHARS", "50000"))
-
-mcp = FastMCP("zeppelin")
 
 
 # ---------------------------------------------------------------------------
@@ -47,11 +45,26 @@ def _tool_error_handler(operation: str):
             try:
                 return await fn(*args, **kwargs)
             except ZeppelinAPIError as e:
-                return f"Error: {e}"
+                raise ToolError(str(e)) from e
+            except ToolError:
+                raise
+            except httpx.HTTPStatusError as e:
+                logger.error("HTTP error %s: %s", operation, e, exc_info=True)
+                raise ToolError(f"Error {operation}: HTTP {e.response.status_code}") from e
             except Exception as e:
-                return f"Error {operation}: {e}"
+                logger.error("Error %s: %s", operation, e, exc_info=True)
+                raise ToolError(f"Error {operation}: {type(e).__name__}") from e
         return wrapper
     return decorator
+
+
+_SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _validate_id(value: str, name: str) -> str:
+    if not value or not _SAFE_ID_PATTERN.match(value):
+        raise ToolError(f"Invalid {name}: must contain only alphanumeric, hyphens, or underscores")
+    return value
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -112,7 +125,9 @@ def _build_params_body(params: Optional[dict[str, Any]]) -> dict[str, Any] | Non
     return None
 
 
-async def _save_paragraph_state(notebook_id: str, paragraph_id: str) -> dict | None:
+async def _save_paragraph_state(
+    zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str
+) -> dict | None:
     """Fetch paragraph data needed for config save/restore."""
     try:
         data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
@@ -125,11 +140,12 @@ async def _save_paragraph_state(notebook_id: str, paragraph_id: str) -> dict | N
                 return p
         return None
     except Exception:
+        logger.warning("Failed to save state for paragraph %s", paragraph_id, exc_info=True)
         return None
 
 
 async def _restore_paragraph_config(
-    notebook_id: str, paragraph_id: str, saved: dict
+    zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str, saved: dict
 ) -> None:
     """Restore paragraph config (chart/visualization settings)."""
     try:
@@ -143,11 +159,15 @@ async def _restore_paragraph_config(
         )
         logger.debug("Restored config for paragraph %s", paragraph_id)
     except Exception:
-        logger.warning("Failed to restore config for paragraph %s", paragraph_id)
+        logger.warning("Failed to restore config for paragraph %s", paragraph_id, exc_info=True)
 
 
 async def _wait_for_notebook_completion(
-    notebook_id: str, timeout: float = 600.0, poll_interval: float = 2.0
+    zeppelin: "ZeppelinClient",
+    notebook_id: str,
+    ctx: Context | None = None,
+    timeout: float = 600.0,
+    poll_interval: float = 2.0,
 ) -> bool:
     """Poll notebook job status until all paragraphs finish or timeout."""
     elapsed = 0.0
@@ -161,13 +181,22 @@ async def _wait_for_notebook_completion(
                 p.get("status") in ("RUNNING", "PENDING", "READY")
                 for p in paragraphs
             ):
+                if ctx:
+                    await ctx.report_progress(elapsed, timeout)
                 return True
+            if ctx:
+                await ctx.report_progress(elapsed, timeout)
         except Exception:
-            pass
+            logger.warning("Error polling notebook %s status", notebook_id, exc_info=True)
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
     logger.warning("Timeout waiting for notebook %s after %.0fs", notebook_id, timeout)
     return False
+
+
+def _get_zeppelin(ctx: Context) -> "ZeppelinClient":
+    """Extract ZeppelinClient from the lifespan context."""
+    return ctx.request_context.lifespan_context.zeppelin
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +214,7 @@ class ZeppelinClient:
     async def login(self) -> None:
         resp = await self.client.post(
             f"{self.base_url}/api/login",
-            data=f"userName={self.username}&password={self.password}",
+            data={"userName": self.username, "password": self.password},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         resp.raise_for_status()
@@ -193,38 +222,67 @@ class ZeppelinClient:
         logger.info("Authenticated with Zeppelin")
 
     async def request(
-        self, method: str, path: str, json: Any = None
+        self, method: str, path: str, json: Any = None, params: dict | None = None
     ) -> dict:
         if not self._authenticated:
             await self.login()
 
         url = f"{self.base_url}{path}"
-        resp = await self.client.request(method, url, json=json)
+        resp = await self.client.request(method, url, json=json, params=params)
 
         if resp.status_code in (401, 403):
             logger.info("Session expired, re-authenticating")
             await self.login()
-            resp = await self.client.request(method, url, json=json)
+            resp = await self.client.request(method, url, json=json, params=params)
 
         resp.raise_for_status()
         return resp.json()
 
+    async def close(self) -> None:
+        await self.client.aclose()
 
-zeppelin = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWORD)
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AppContext:
+    zeppelin: ZeppelinClient
+
+
+@asynccontextmanager
+async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+    if not ZEPPELIN_BASE_URL:
+        raise ValueError("ZEPPELIN_BASE_URL environment variable is required")
+    if not ZEPPELIN_USERNAME:
+        raise ValueError("ZEPPELIN_USERNAME environment variable is required")
+    if not ZEPPELIN_PASSWORD:
+        raise ValueError("ZEPPELIN_PASSWORD environment variable is required")
+    client = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWORD)
+    try:
+        yield AppContext(zeppelin=client)
+    finally:
+        await client.close()
+
+
+mcp = FastMCP("zeppelin", lifespan=app_lifespan)
+mcp._mcp_server.version = "0.1.0"
 
 
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("listing notebooks")
-async def list_notebooks(name_filter: Optional[str] = None) -> str:
+async def list_notebooks(ctx: Context, name_filter: Optional[str] = None) -> str:
     """List notebooks on the Zeppelin server.
 
     Args:
         name_filter: Optional substring filter (case-insensitive) matched against the full path.
     """
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("GET", "/api/notebook"))
     notebooks = data.get("body", [])
     if name_filter:
@@ -241,15 +299,20 @@ async def list_notebooks(name_filter: Optional[str] = None) -> str:
     return f"Found {len(notebooks)} notebooks:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("searching notebooks")
-async def search_notebooks(query: str) -> str:
+async def search_notebooks(ctx: Context, query: str) -> str:
     """Full-text search across all notebook paragraphs.
 
     Args:
         query: Search query string
     """
-    data = _check_status(await zeppelin.request("GET", f"/api/notebook/search?q={query}"))
+    if not query or not query.strip():
+        raise ToolError("Search query must not be empty")
+    if len(query) > 1000:
+        raise ToolError("Search query too long (max 1000 characters)")
+    zeppelin = _get_zeppelin(ctx)
+    data = _check_status(await zeppelin.request("GET", "/api/notebook/search", params={"q": query}))
     results = data.get("body", [])
     if not results:
         return f"No results found for '{query}'."
@@ -272,15 +335,17 @@ async def search_notebooks(query: str) -> str:
     return f"Found {len(results)} results for '{query}':\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting notebook")
-async def get_notebook(notebook_id: str) -> str:
+async def get_notebook(ctx: Context, notebook_id: str) -> str:
     """Get full notebook details including all paragraphs, code, and output.
     Can be very large — prefer list_paragraphs + get_paragraph when possible.
 
     Args:
         notebook_id: The notebook ID to retrieve
     """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
     nb = data.get("body", {})
     paragraphs = nb.get("paragraphs", [])
@@ -306,14 +371,16 @@ async def get_notebook(notebook_id: str) -> str:
     return _truncate("\n".join(lines))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("listing paragraphs")
-async def list_paragraphs(notebook_id: str) -> str:
+async def list_paragraphs(ctx: Context, notebook_id: str) -> str:
     """List paragraph metadata (index, id, title, status) without code or output.
 
     Args:
         notebook_id: The notebook ID to list paragraphs for
     """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
     nb = data.get("body", {})
     paragraphs = nb.get("paragraphs", [])
@@ -336,15 +403,18 @@ async def list_paragraphs(notebook_id: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting paragraph")
-async def get_paragraph(notebook_id: str, paragraph_id: str) -> str:
+async def get_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
     """Get full content of a single paragraph (code, output, and dynamic forms).
 
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to retrieve
     """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request(
         "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
     ))
@@ -367,15 +437,41 @@ async def get_paragraph(notebook_id: str, paragraph_id: str) -> str:
     return _truncate("\n".join(lines))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("getting paragraph code")
+async def get_paragraph_code(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
+    """Get only the code/text content of a paragraph, without output or forms.
+    Use this instead of get_paragraph when you only need to read the code to save on output size.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to retrieve
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    data = _check_status(await zeppelin.request(
+        "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    p = data.get("body", {})
+    text = p.get("text", "")
+    if not text:
+        return f"Paragraph {paragraph_id} has no code."
+    return text
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting paragraph forms")
-async def get_paragraph_forms(notebook_id: str, paragraph_id: str) -> str:
+async def get_paragraph_forms(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
     """Get dynamic form definitions and current parameter values for a paragraph.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to inspect
     """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request(
         "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
     ))
@@ -386,10 +482,10 @@ async def get_paragraph_forms(notebook_id: str, paragraph_id: str) -> str:
     return "\n".join(form_lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("updating paragraph forms")
 async def update_paragraph_forms(
-    notebook_id: str, paragraph_id: str, params: dict[str, Any]
+    ctx: Context, notebook_id: str, paragraph_id: str, params: dict[str, Any]
 ) -> str:
     """Update dynamic form values without re-executing the paragraph.
     Safest way to change form parameters when chart settings must be preserved.
@@ -399,9 +495,12 @@ async def update_paragraph_forms(
         paragraph_id: The paragraph ID to update
         params: Dict of form values to set, e.g. {"city": "Seoul", "limit": "10"}.
     """
-    saved = await _save_paragraph_state(notebook_id, paragraph_id)
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
     if saved is None:
-        return f"Error: could not fetch paragraph {paragraph_id}"
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
 
     settings = saved.get("settings", {})
     existing_params = settings.get("params", {})
@@ -429,9 +528,10 @@ async def update_paragraph_forms(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("updating paragraph config")
 async def update_paragraph_config(
+    ctx: Context,
     notebook_id: str,
     paragraph_id: str,
     config: dict[str, Any],
@@ -444,7 +544,10 @@ async def update_paragraph_config(
         paragraph_id: The paragraph ID to configure
         config: Dict of config fields to set or update. Merged with existing config.
     """
-    saved = await _save_paragraph_state(notebook_id, paragraph_id)
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
     if saved:
         current_config = saved.get("config", {})
         if "graph" in config:
@@ -496,21 +599,23 @@ async def update_paragraph_config(
     return ". ".join(parts) + "."
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("creating notebook")
-async def create_notebook(name: str) -> str:
+async def create_notebook(ctx: Context, name: str) -> str:
     """Create a new empty notebook.
 
     Args:
         name: Name for the new notebook
     """
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("POST", "/api/notebook", json={"name": name}))
     return f"Created notebook with id: {data.get('body', 'unknown')}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("adding paragraph")
 async def add_paragraph(
+    ctx: Context,
     notebook_id: str,
     text: str,
     title: Optional[str] = None,
@@ -524,6 +629,8 @@ async def add_paragraph(
         title: Optional title for the paragraph
         index: Optional position index to insert the paragraph at
     """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
     body: dict[str, Any] = {"text": text}
     if title is not None:
         body["title"] = title
@@ -535,9 +642,10 @@ async def add_paragraph(
     return f"Added paragraph with id: {data.get('body', 'unknown')}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("running paragraph")
 async def run_paragraph(
+    ctx: Context,
     notebook_id: str,
     paragraph_id: str,
     params: Optional[dict[str, Any]] = None,
@@ -550,7 +658,10 @@ async def run_paragraph(
         paragraph_id: The paragraph ID to run
         params: Optional dict of dynamic form values, e.g. {"city": "Seoul"}.
     """
-    saved = await _save_paragraph_state(notebook_id, paragraph_id)
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
 
     data = _check_status(await zeppelin.request(
         "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}",
@@ -559,7 +670,7 @@ async def run_paragraph(
 
     if saved is not None:
         await asyncio.sleep(0.5)
-        await _restore_paragraph_config(notebook_id, paragraph_id, saved)
+        await _restore_paragraph_config(zeppelin, notebook_id, paragraph_id, saved)
 
     resp_body = data.get("body", {})
     code = resp_body.get("code", "UNKNOWN")
@@ -568,9 +679,10 @@ async def run_paragraph(
     return _truncate("\n".join(lines))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("running all paragraphs")
 async def run_all_paragraphs(
+    ctx: Context,
     notebook_id: str,
     params: Optional[dict[str, Any]] = None,
 ) -> str:
@@ -581,6 +693,8 @@ async def run_all_paragraphs(
         notebook_id: The notebook ID to run
         params: Optional dict of dynamic form values, e.g. {"city": "Seoul"}.
     """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
     nb_data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
     saved_paragraphs: list[dict] = []
     if nb_data.get("status") == "OK":
@@ -591,13 +705,13 @@ async def run_all_paragraphs(
         json=_build_params_body(params),
     ))
 
-    completed = await _wait_for_notebook_completion(notebook_id)
+    completed = await _wait_for_notebook_completion(zeppelin, notebook_id, ctx=ctx)
 
     restored = 0
     for p in saved_paragraphs:
         pid = p.get("id")
         if pid and p.get("config"):
-            await _restore_paragraph_config(notebook_id, pid, p)
+            await _restore_paragraph_config(zeppelin, notebook_id, pid, p)
             restored += 1
 
     status = "completed" if completed else "timed out"
@@ -607,15 +721,18 @@ async def run_all_paragraphs(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting paragraph status")
-async def get_paragraph_status(notebook_id: str, paragraph_id: str) -> str:
+async def get_paragraph_status(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
     """Get execution status of a specific paragraph (useful after async run).
 
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to check
     """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request(
         "GET", f"/api/notebook/job/{notebook_id}/{paragraph_id}"
     ))
@@ -641,7 +758,9 @@ async def get_paragraph_status(notebook_id: str, paragraph_id: str) -> str:
                     f"\n{l}" for l in _format_messages(results["msg"], label="Error Output")
                 )
         except Exception:
-            pass
+            logger.warning(
+                "Failed to fetch error details for paragraph %s", paragraph_id, exc_info=True
+            )
     return _truncate("\n".join(lines))
 
 
