@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import html
 import os
 import logging
 import re
@@ -78,11 +79,24 @@ def _indent(text: str, spaces: int) -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and decode HTML entities for plain-text output."""
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _format_messages(msgs: list[dict], indent: int = 0, prefix: str = "", label: str = "Output") -> list[str]:
     lines = []
     for msg in msgs:
         msg_data = msg.get("data", "").strip()
         if msg_data:
+            if msg.get("type") == "HTML":
+                msg_data = _strip_html(msg_data)
+            if not msg_data:
+                continue
             text = _indent(msg_data, indent) if indent else msg_data
             lines.append(f"{prefix}{label} ({msg.get('type', 'TEXT')}):\n{text}")
     return lines
