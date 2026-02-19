@@ -88,17 +88,40 @@ def _strip_html(text: str) -> str:
     return text.strip()
 
 
-def _format_messages(msgs: list[dict], indent: int = 0, prefix: str = "", label: str = "Output") -> list[str]:
+def _limit_table_rows(text: str, max_rows: int = 50) -> str:
+    """Limit tab-separated table output to header + max_rows data rows."""
+    lines = text.split("\n")
+    # Heuristic: if first line contains tabs, it's likely a TSV table
+    if not lines or "\t" not in lines[0]:
+        return text
+    data_lines = [l for l in lines if l.strip()]
+    if len(data_lines) <= max_rows + 1:  # +1 for header
+        return text
+    limited = data_lines[:max_rows + 1]
+    total = len(data_lines) - 1  # exclude header
+    limited.append(f"\n... ({max_rows} of {total} rows shown)")
+    return "\n".join(limited)
+
+
+def _format_messages(msgs: list[dict], indent: int = 0, prefix: str = "", label: str = "Output",
+                     skip_html: bool = False, limit_rows: int = 0) -> list[str]:
     lines = []
     for msg in msgs:
+        msg_type = msg.get("type", "TEXT")
         msg_data = msg.get("data", "").strip()
-        if msg_data:
-            if msg.get("type") == "HTML":
-                msg_data = _strip_html(msg_data)
+        if not msg_data:
+            continue
+        if msg_type == "HTML":
+            if skip_html:
+                lines.append(f"{prefix}{label}: [Visualization output omitted]")
+                continue
+            msg_data = _strip_html(msg_data)
             if not msg_data:
                 continue
-            text = _indent(msg_data, indent) if indent else msg_data
-            lines.append(f"{prefix}{label} ({msg.get('type', 'TEXT')}):\n{text}")
+        if limit_rows > 0 and msg_type in ("TEXT", "TABLE"):
+            msg_data = _limit_table_rows(msg_data, max_rows=limit_rows)
+        text = _indent(msg_data, indent) if indent else msg_data
+        lines.append(f"{prefix}{label} ({msg_type}):\n{text}")
     return lines
 
 
@@ -361,8 +384,8 @@ async def search_notebooks(ctx: Context, query: str) -> str:
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting notebook")
 async def get_notebook(ctx: Context, notebook_id: str) -> str:
-    """Get full notebook details including all paragraphs, code, and output.
-    Can be very large — prefer list_paragraphs + get_paragraph when possible.
+    """Get notebook overview with all paragraph code, titles, and status.
+    Does not include paragraph output — use get_paragraph to inspect output of specific paragraphs.
 
     Args:
         notebook_id: The notebook ID to retrieve
@@ -387,11 +410,8 @@ async def get_notebook(ctx: Context, notebook_id: str) -> str:
         if form_lines:
             for fl in form_lines:
                 lines.append(f"  {fl}")
-        results = p.get("results", {})
-        if results and results.get("msg"):
-            lines.extend(f"  {l}" for l in _format_messages(results["msg"], indent=2))
         lines.append("")
-    return _truncate("\n".join(lines))
+    return "\n".join(lines)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -456,7 +476,7 @@ async def get_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> st
     lines.extend(_format_forms(p))
     results = p.get("results", {})
     if results and results.get("msg"):
-        lines.extend(_format_messages(results["msg"], indent=2))
+        lines.extend(_format_messages(results["msg"], indent=2, skip_html=True, limit_rows=50))
     return _truncate("\n".join(lines))
 
 
@@ -723,7 +743,7 @@ async def run_paragraph(
     resp_body = data.get("body", {})
     code = resp_body.get("code", "UNKNOWN")
     lines = [f"Status: {code}"]
-    lines.extend(_format_messages(resp_body.get("msg", [])))
+    lines.extend(_format_messages(resp_body.get("msg", []), skip_html=True, limit_rows=50))
     return _truncate("\n".join(lines))
 
 
