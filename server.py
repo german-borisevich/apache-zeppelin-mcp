@@ -104,7 +104,7 @@ def _limit_table_rows(text: str, max_rows: int = 50) -> str:
 
 
 def _format_messages(msgs: list[dict], indent: int = 0, prefix: str = "", label: str = "Output",
-                     skip_html: bool = False, limit_rows: int = 0) -> list[str]:
+                     include_html: bool = True, limit_rows: int = 0) -> list[str]:
     lines = []
     for msg in msgs:
         msg_type = msg.get("type", "TEXT")
@@ -112,7 +112,7 @@ def _format_messages(msgs: list[dict], indent: int = 0, prefix: str = "", label:
         if not msg_data:
             continue
         if msg_type == "HTML":
-            if skip_html:
+            if not include_html:
                 lines.append(f"{prefix}{label}: [Visualization output omitted]")
                 continue
             msg_data = _strip_html(msg_data)
@@ -448,12 +448,22 @@ async def list_paragraphs(ctx: Context, notebook_id: str) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting paragraph")
-async def get_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
+async def get_paragraph(
+    ctx: Context, notebook_id: str, paragraph_id: str,
+    max_rows: int = 50, include_html: bool = False,
+) -> str:
     """Get full content of a single paragraph (code, output, and dynamic forms).
+
+    By default, table output is limited to 50 rows and HTML output is omitted to save tokens.
+    When investigating data discrepancies, set max_rows=0 for unlimited rows.
+    If the paragraph uses HTML rendering (without z.show()), set include_html=True to see
+    text extracted from HTML. Alternatively, query the underlying data via SQL if available.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to retrieve
+        max_rows: Maximum data rows for table output (default 50, 0 = unlimited). Header row always included.
+        include_html: If True, include HTML output converted to plain text. If False (default), HTML is omitted.
     """
     _validate_id(notebook_id, "notebook_id")
     _validate_id(paragraph_id, "paragraph_id")
@@ -476,7 +486,7 @@ async def get_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> st
     lines.extend(_format_forms(p))
     results = p.get("results", {})
     if results and results.get("msg"):
-        lines.extend(_format_messages(results["msg"], indent=2, skip_html=True, limit_rows=50))
+        lines.extend(_format_messages(results["msg"], indent=2, include_html=include_html, limit_rows=max_rows))
     return _truncate("\n".join(lines))
 
 
@@ -717,14 +727,22 @@ async def run_paragraph(
     notebook_id: str,
     paragraph_id: str,
     params: Optional[dict[str, Any]] = None,
+    max_rows: int = 50,
+    include_html: bool = False,
 ) -> str:
     """Run a paragraph synchronously and return the result.
     Chart settings are saved/restored automatically around execution.
+
+    By default, table output is limited to 50 rows and HTML output is omitted to save tokens.
+    Set max_rows=0 for unlimited rows when you need full results for analysis.
+    Set include_html=True to see HTML output converted to plain text.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to run
         params: Optional dict of dynamic form values, e.g. {"city": "Seoul"}.
+        max_rows: Maximum data rows for table output (default 50, 0 = unlimited). Header row always included.
+        include_html: If True, include HTML output converted to plain text. If False (default), HTML is omitted.
     """
     _validate_id(notebook_id, "notebook_id")
     _validate_id(paragraph_id, "paragraph_id")
@@ -743,7 +761,7 @@ async def run_paragraph(
     resp_body = data.get("body", {})
     code = resp_body.get("code", "UNKNOWN")
     lines = [f"Status: {code}"]
-    lines.extend(_format_messages(resp_body.get("msg", []), skip_html=True, limit_rows=50))
+    lines.extend(_format_messages(resp_body.get("msg", []), include_html=include_html, limit_rows=max_rows))
     return _truncate("\n".join(lines))
 
 
