@@ -166,6 +166,15 @@ async def _restore_paragraph_config(
         config = saved.get("config")
         if not config:
             return
+
+        # If the saved config had no results, preserve results created during execution
+        if not config.get("results"):
+            current = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+            if current:
+                new_results = current.get("config", {}).get("results")
+                if new_results:
+                    config["results"] = new_results
+
         await zeppelin.request(
             "PUT",
             f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
@@ -557,6 +566,12 @@ async def update_paragraph_config(
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to configure
         config: Dict of config fields to set or update. Merged with existing config.
+            To change chart type, set graph.mode to one of:
+            "table", "multiBarChart", "stackedAreaChart", "lineChart",
+            "pieChart", "scatterChart".
+            Example: {"graph": {"mode": "multiBarChart",
+                                "keys": [{"name": "date_col"}],
+                                "values": [{"name": "amount_col"}]}}
     """
     _validate_id(notebook_id, "notebook_id")
     _validate_id(paragraph_id, "paragraph_id")
@@ -588,9 +603,13 @@ async def update_paragraph_config(
             merged_graph = {**current_config.get("graph", {}), **user_graph}
             config = {**current_config, **config, "graph": merged_graph}
             results = config.get("results", {})
-            for result_data in results.values():
-                if isinstance(result_data, dict) and "graph" in result_data:
-                    result_data["graph"] = {**result_data["graph"], **user_graph}
+            if results:
+                for result_data in results.values():
+                    if isinstance(result_data, dict) and "graph" in result_data:
+                        result_data["graph"] = {**result_data["graph"], **user_graph}
+            else:
+                # No results entries — create one with the merged graph config
+                config["results"] = {"0": {"graph": {**merged_graph}}}
         else:
             config = {**current_config, **config}
 
@@ -653,7 +672,22 @@ async def add_paragraph(
     data = _check_status(await zeppelin.request(
         "POST", f"/api/notebook/{notebook_id}/paragraph", json=body
     ))
-    return f"Added paragraph with id: {data.get('body', 'unknown')}"
+    paragraph_id = data.get("body", "unknown")
+
+    if title is not None and paragraph_id != "unknown":
+        try:
+            saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+            cfg = saved.get("config", {}) if saved else {}
+            cfg["title"] = True
+            await zeppelin.request(
+                "PUT",
+                f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+                json=cfg,
+            )
+        except Exception:
+            logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
+
+    return f"Added paragraph with id: {paragraph_id}"
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))

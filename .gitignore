@@ -9,3 +9,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Credentials
+*.json
+!package.json
+!.claude/**
+.claude/settings.local.json
+!.mcp.json.example
+credentials/
