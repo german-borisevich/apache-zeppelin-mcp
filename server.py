@@ -850,6 +850,63 @@ async def get_paragraph_status(ctx: Context, notebook_id: str, paragraph_id: str
     return _truncate("\n".join(lines))
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("getting notebook permissions")
+async def get_notebook_permissions(ctx: Context, notebook_id: str) -> str:
+    """Get permission information for a notebook (owners, writers, readers).
+
+    Args:
+        notebook_id: The notebook ID to get permissions for
+    """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
+    data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}/permissions"))
+    body = data.get("body", {})
+    owners = body.get("owners", [])
+    writers = body.get("writers", [])
+    readers = body.get("readers", [])
+    lines = [
+        f"Permissions for notebook {notebook_id}:",
+        f"  Owners:  {', '.join(owners) if owners else '(none)'}",
+        f"  Writers: {', '.join(writers) if writers else '(none)'}",
+        f"  Readers: {', '.join(readers) if readers else '(none)'}",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("setting notebook permissions")
+async def set_notebook_permissions(
+    ctx: Context,
+    notebook_id: str,
+    owners: list[str],
+    writers: list[str],
+    readers: list[str],
+) -> str:
+    """Set permission information for a notebook.
+
+    Args:
+        notebook_id: The notebook ID to set permissions for
+        owners: List of usernames with owner access
+        writers: List of usernames with write access
+        readers: List of usernames with read access
+    """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
+    _check_status(await zeppelin.request(
+        "PUT",
+        f"/api/notebook/{notebook_id}/permissions",
+        json={"owners": owners, "writers": writers, "readers": readers},
+    ))
+    lines = [
+        f"Updated permissions for notebook {notebook_id}:",
+        f"  Owners:  {', '.join(owners) if owners else '(none)'}",
+        f"  Writers: {', '.join(writers) if writers else '(none)'}",
+        f"  Readers: {', '.join(readers) if readers else '(none)'}",
+    ]
+    return "\n".join(lines)
+
+
 def main():
     mcp.run(transport="stdio")
 
