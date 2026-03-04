@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "zeppelin": {
+      "command": "uv",
+      "args": [
+        "--directory", "/path/to/apache-zeppelin-mcp",
+        "run", "server.py"
+      ],
+      "env": {
+        "ZEPPELIN_BASE_URL": "https://your-zeppelin-host.example.com",
+        "ZEPPELIN_USERNAME": "your-username",
+        "ZEPPELIN_PASSWORD": "your-password"
+      }
+    }
+  }
+}
