@@ -156,6 +156,36 @@ def _format_forms(paragraph: dict) -> list[str]:
     return lines
 
 
+def _format_config(paragraph: dict) -> list[str]:
+    """Format paragraph visualization config for display."""
+    config = paragraph.get("config", {})
+    # Chart config can be in config.graph (dict) or config.results (list of dicts with "graph" key)
+    graph = config.get("graph", {})
+    if not graph:
+        results = config.get("results")
+        if isinstance(results, list) and results:
+            graph = results[0].get("graph", {})
+        elif isinstance(results, dict):
+            first = next(iter(results.values()), {})
+            if isinstance(first, dict):
+                graph = first.get("graph", {})
+    if not graph:
+        return []
+    lines = ["Visualization:"]
+    mode = graph.get("mode", "table")
+    lines.append(f"  chart type: {mode}")
+    if graph.get("keys"):
+        lines.append(f"  keys: {[k['name'] for k in graph['keys']]}")
+    if graph.get("groups"):
+        lines.append(f"  groups: {[g['name'] for g in graph['groups']]}")
+    if graph.get("values"):
+        lines.append(f"  values: {[v['name'] for v in graph['values']]}")
+    col_width = config.get("colWidth")
+    if col_width and col_width != 12:
+        lines.append(f"  colWidth: {col_width}")
+    return lines
+
+
 def _build_params_body(params: Optional[dict[str, Any]]) -> dict[str, Any] | None:
     if params:
         return {"params": params}
@@ -383,12 +413,13 @@ async def search_notebooks(ctx: Context, query: str) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting notebook")
-async def get_notebook(ctx: Context, notebook_id: str) -> str:
+async def get_notebook(ctx: Context, notebook_id: str, include_config: bool = False) -> str:
     """Get notebook overview with all paragraph code, titles, and status.
     Does not include paragraph output — use get_paragraph to inspect output of specific paragraphs.
 
     Args:
         notebook_id: The notebook ID to retrieve
+        include_config: If True, include visualization/chart config for each paragraph. Default False.
     """
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
@@ -410,6 +441,11 @@ async def get_notebook(ctx: Context, notebook_id: str) -> str:
         if form_lines:
             for fl in form_lines:
                 lines.append(f"  {fl}")
+        if include_config:
+            config_lines = _format_config(p)
+            if config_lines:
+                for cl in config_lines:
+                    lines.append(f"  {cl}")
         lines.append("")
     return "\n".join(lines)
 
@@ -484,6 +520,7 @@ async def get_paragraph(
     if text:
         lines.append(f"Code:\n{_indent(text, 2)}")
     lines.extend(_format_forms(p))
+    lines.extend(_format_config(p))
     results = p.get("results", {})
     if results and results.get("msg"):
         lines.extend(_format_messages(results["msg"], indent=2, include_html=include_html, limit_rows=max_rows))
