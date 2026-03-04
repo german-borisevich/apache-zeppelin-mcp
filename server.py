@@ -865,11 +865,13 @@ async def get_notebook_permissions(ctx: Context, notebook_id: str) -> str:
     owners = body.get("owners", [])
     writers = body.get("writers", [])
     readers = body.get("readers", [])
+    runners = body.get("runners", [])
     lines = [
         f"Permissions for notebook {notebook_id}:",
         f"  Owners:  {', '.join(owners) if owners else '(none)'}",
         f"  Writers: {', '.join(writers) if writers else '(none)'}",
         f"  Readers: {', '.join(readers) if readers else '(none)'}",
+        f"  Runners: {', '.join(runners) if runners else '(none)'}",
     ]
     return "\n".join(lines)
 
@@ -882,6 +884,7 @@ async def set_notebook_permissions(
     owners: list[str],
     writers: list[str],
     readers: list[str],
+    runners: list[str] = [],
 ) -> str:
     """Set permission information for a notebook.
 
@@ -890,19 +893,21 @@ async def set_notebook_permissions(
         owners: List of usernames with owner access
         writers: List of usernames with write access
         readers: List of usernames with read access
+        runners: List of usernames with runner access
     """
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
     _check_status(await zeppelin.request(
         "PUT",
         f"/api/notebook/{notebook_id}/permissions",
-        json={"owners": owners, "writers": writers, "readers": readers},
+        json={"owners": owners, "writers": writers, "readers": readers, "runners": runners},
     ))
     lines = [
         f"Updated permissions for notebook {notebook_id}:",
         f"  Owners:  {', '.join(owners) if owners else '(none)'}",
         f"  Writers: {', '.join(writers) if writers else '(none)'}",
         f"  Readers: {', '.join(readers) if readers else '(none)'}",
+        f"  Runners: {', '.join(runners) if runners else '(none)'}",
     ]
     return "\n".join(lines)
 
