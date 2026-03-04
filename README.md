@@ -26,6 +26,8 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `run_paragraph` | Run a paragraph synchronously and return the result (preserves chart settings when using params) |
 | `run_all_paragraphs` | Run all paragraphs in a notebook and wait for completion (preserves chart settings when using params) |
 | `get_paragraph_status` | Check execution status of a paragraph |
+| `get_notebook_permissions` | Get permission information for a notebook (owners, writers, readers) |
+| `set_notebook_permissions` | Set owners, writers, and readers for a notebook |
 
 For safety, delete and edit operations on existing paragraphs are deliberately not exposed.
 
@@ -146,7 +148,7 @@ mcp dev server.py
 ```
 
 This opens a browser where you can:
-- See all 14 registered tools
+- See all 16 registered tools
 - Call `list_notebooks` to verify the connection to Zeppelin is working
 - Test `search_notebooks` with a keyword
 - Try `get_notebook` with a notebook ID from the list
@@ -157,7 +159,7 @@ This opens a browser where you can:
 After adding the server to `claude_desktop_config.json` and restarting Claude Desktop:
 
 1. Open a new conversation
-2. Click the hammer icon at the bottom of the input box — you should see all 14 Zeppelin tools listed
+2. Click the hammer icon at the bottom of the input box — you should see all 16 Zeppelin tools listed
 3. Ask Claude: *"List all my Zeppelin notebooks"*
 4. Claude will call `list_notebooks` and show the results
 
