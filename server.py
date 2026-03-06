@@ -361,6 +361,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         raise ValueError("ZEPPELIN_PASSWORD environment variable is required")
     client = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWORD)
     try:
+        await client.login()
         yield AppContext(zeppelin=client)
     finally:
         await client.close()

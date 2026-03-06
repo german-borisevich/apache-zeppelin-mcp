@@ -135,9 +135,9 @@ ZEPPELIN_PASSWORD=your-password \
 uv run server.py
 ```
 
-If configuration is correct the process will start and wait for input on stdin (this is normal — it communicates via the MCP stdio protocol). Press `Ctrl+C` to stop. Authentication happens lazily on the first tool call.
+If configuration is correct the server will authenticate with Zeppelin and then wait for input on stdin (this is normal — it communicates via the MCP stdio protocol). Press `Ctrl+C` to stop.
 
-If environment variables are missing you will see a `ValueError` immediately.
+If environment variables are missing you will see a `ValueError` immediately. If credentials are wrong, you will see an authentication error at startup.
 
 ### 2. Test tools with MCP Inspector
 
@@ -200,7 +200,7 @@ If all steps succeed, the server is fully operational.
 |---------|-------|-----|
 | `ValueError: ZEPPELIN_BASE_URL environment variable is required` | Missing env vars | Set all three env vars (`ZEPPELIN_BASE_URL`, `ZEPPELIN_USERNAME`, `ZEPPELIN_PASSWORD`) |
 | `httpx.ConnectError` | Zeppelin is unreachable | Verify `ZEPPELIN_BASE_URL` is correct and Zeppelin is running |
-| `HTTP 401/403` on first tool call | Wrong credentials | Check `ZEPPELIN_USERNAME` and `ZEPPELIN_PASSWORD` |
+| Authentication error at startup | Wrong credentials | Check `ZEPPELIN_USERNAME` and `ZEPPELIN_PASSWORD` |
 | Tools don't appear in Claude Desktop | Config error or server crash | Check the MCP log files and verify `claude_desktop_config.json` syntax |
 | Tools don't appear in Claude Code | Server not registered | Run `claude mcp list` and re-add if missing |
 
