@@ -6,6 +6,7 @@ import os
 import logging
 import re
 import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -262,8 +263,11 @@ async def _wait_for_notebook_completion(
     poll_interval: float = 2.0,
 ) -> bool:
     """Poll notebook job status until all paragraphs finish or timeout."""
-    elapsed = 0.0
-    while elapsed < timeout:
+    deadline = time.monotonic() + timeout
+    while True:
+        elapsed = timeout - (deadline - time.monotonic())
+        if time.monotonic() >= deadline:
+            break
         try:
             data = _check_status(await zeppelin.request(
                 "GET", f"/api/notebook/job/{notebook_id}"
@@ -281,7 +285,6 @@ async def _wait_for_notebook_completion(
         except Exception:
             logger.warning("Error polling notebook %s status", notebook_id, exc_info=True)
         await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
     logger.warning("Timeout waiting for notebook %s after %.0fs", notebook_id, timeout)
     return False
 
@@ -304,6 +307,7 @@ class ZeppelinClient:
         self._authenticated = False
 
     async def login(self) -> None:
+        self.client.cookies.clear()
         resp = await self.client.post(
             f"{self.base_url}/api/login",
             data={"userName": self.username, "password": self.password},
@@ -326,8 +330,8 @@ class ZeppelinClient:
             kw["timeout"] = httpx.Timeout(timeout)
         resp = await self.client.request(method, url, **kw)
 
-        if resp.status_code in (401, 403):
-            logger.info("Session expired, re-authenticating")
+        if resp.status_code in (401, 403) or resp.is_redirect:
+            logger.info("Session expired (HTTP %s), re-authenticating", resp.status_code)
             await self.login()
             resp = await self.client.request(method, url, **kw)
 
@@ -357,6 +361,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         raise ValueError("ZEPPELIN_PASSWORD environment variable is required")
     client = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWORD)
     try:
+        await client.login()
         yield AppContext(zeppelin=client)
     finally:
         await client.close()
@@ -372,11 +377,14 @@ mcp._mcp_server.version = "0.1.0"
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("listing notebooks")
-async def list_notebooks(ctx: Context, name_filter: Optional[str] = None) -> str:
+async def list_notebooks(ctx: Context, name_filter: Optional[str] = None, limit: int = 100) -> str:
     """List notebooks on the Zeppelin server.
+
+    Always use name_filter to narrow results — the server may have thousands of notebooks.
 
     Args:
         name_filter: Optional substring filter (case-insensitive) matched against the full path.
+        limit: Maximum number of notebooks to return (default 100, 0 = unlimited).
     """
     zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("GET", "/api/notebook"))
@@ -391,17 +399,24 @@ async def list_notebooks(ctx: Context, name_filter: Optional[str] = None) -> str
         if name_filter:
             return f"No notebooks matching '{name_filter}'."
         return "No notebooks found."
+    total = len(notebooks)
+    if limit > 0 and total > limit:
+        notebooks = notebooks[:limit]
     lines = [f"- {nb.get('id', 'N/A')}: {nb.get('path', nb.get('name', 'N/A'))}" for nb in notebooks]
-    return f"Found {len(notebooks)} notebooks:\n" + "\n".join(lines)
+    header = f"Found {total} notebooks"
+    if limit > 0 and total > limit:
+        header += f" (showing first {limit}, use name_filter to narrow)"
+    return header + ":\n" + "\n".join(lines)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("searching notebooks")
-async def search_notebooks(ctx: Context, query: str) -> str:
+async def search_notebooks(ctx: Context, query: str, max_results: int = 20) -> str:
     """Full-text search across all notebook paragraphs.
 
     Args:
         query: Search query string
+        max_results: Maximum number of results to return (default 20, 0 = unlimited).
     """
     if not query or not query.strip():
         raise ToolError("Search query must not be empty")
@@ -412,6 +427,9 @@ async def search_notebooks(ctx: Context, query: str) -> str:
     results = data.get("body", [])
     if not results:
         return f"No results found for '{query}'."
+    total = len(results)
+    if max_results > 0 and total > max_results:
+        results = results[:max_results]
     lines = []
     for r in results:
         raw_id = r.get("id", "")
@@ -428,7 +446,10 @@ async def search_notebooks(ctx: Context, query: str) -> str:
             f"Header: {header} | "
             f"Snippet: {snippet}"
         )
-    return f"Found {len(results)} results for '{query}':\n" + "\n".join(lines)
+    header_line = f"Found {total} results for '{query}'"
+    if max_results > 0 and total > max_results:
+        header_line += f" (showing first {max_results})"
+    return header_line + ":\n" + "\n".join(lines)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -436,6 +457,9 @@ async def search_notebooks(ctx: Context, query: str) -> str:
 async def get_notebook(ctx: Context, notebook_id: str, include_config: bool = False) -> str:
     """Get notebook overview with all paragraph code, titles, and status.
     Does not include paragraph output — use get_paragraph to inspect output of specific paragraphs.
+
+    For large notebooks, prefer list_paragraphs first to identify paragraphs of interest,
+    then get_paragraph_code for targeted reads.
 
     Args:
         notebook_id: The notebook ID to retrieve
@@ -648,6 +672,7 @@ async def update_paragraph_config(
 ) -> str:
     """Update paragraph visualization/chart config (graph type, columns, display settings).
     Fetches current config and deep-merges provided changes.
+    Column index and aggr fields are auto-filled from the paragraph's output headers — only provide name.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
@@ -729,7 +754,7 @@ async def create_notebook(ctx: Context, name: str) -> str:
     """Create a new empty notebook.
 
     Args:
-        name: Name for the new notebook
+        name: Full path for the new notebook, e.g. "Users/john/ProjectName/Notebook Title"
     """
     zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("POST", "/api/notebook", json={"name": name}))
@@ -798,6 +823,8 @@ async def run_paragraph(
     Set max_rows=0 for unlimited rows when you need full results for analysis.
     Set include_html=True to see HTML output converted to plain text.
 
+    On error, the response includes the error output — examine it before retrying.
+
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to run
@@ -817,7 +844,6 @@ async def run_paragraph(
     ))
 
     if saved is not None:
-        await asyncio.sleep(0.5)
         await _restore_paragraph_config(zeppelin, notebook_id, paragraph_id, saved)
 
     resp_body = data.get("body", {})
@@ -912,6 +938,24 @@ async def get_paragraph_status(ctx: Context, notebook_id: str, paragraph_id: str
     return _truncate("\n".join(lines))
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("stopping paragraph")
+async def stop_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
+    """Stop a running paragraph. Use this to cancel long-running or stuck queries.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to stop
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    _check_status(await zeppelin.request(
+        "DELETE", f"/api/notebook/job/{notebook_id}/{paragraph_id}"
+    ))
+    return f"Stop signal sent to paragraph {paragraph_id}."
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
 @_tool_error_handler("getting notebook permissions")
 async def get_notebook_permissions(ctx: Context, notebook_id: str) -> str:
@@ -946,7 +990,7 @@ async def set_notebook_permissions(
     owners: list[str],
     writers: list[str],
     readers: list[str],
-    runners: list[str] = [],
+    runners: list[str] | None = None,
 ) -> str:
     """Set permission information for a notebook.
 
@@ -958,6 +1002,8 @@ async def set_notebook_permissions(
         runners: List of usernames with runner access
     """
     _validate_id(notebook_id, "notebook_id")
+    if runners is None:
+        runners = []
     zeppelin = _get_zeppelin(ctx)
     _check_status(await zeppelin.request(
         "PUT",
@@ -978,6 +1024,7 @@ async def set_notebook_permissions(
 @_tool_error_handler("exporting notebook")
 async def export_notebook(ctx: Context, notebook_id: str) -> str:
     """Export notebook as JSON (for cross-server migration or backup).
+    Warning: output can be very large for notebooks with many paragraphs or large results.
 
     Args:
         notebook_id: The notebook ID to export
@@ -985,7 +1032,7 @@ async def export_notebook(ctx: Context, notebook_id: str) -> str:
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("GET", f"/api/notebook/export/{notebook_id}"))
-    return json.dumps(data.get("body", {}))
+    return _truncate(json.dumps(data.get("body", {})))
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))

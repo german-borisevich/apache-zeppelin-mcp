@@ -12,22 +12,25 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 
 | Tool | Description |
 |------|-------------|
-| `list_notebooks` | List notebooks, with optional `name_filter` for case-insensitive substring matching |
-| `search_notebooks` | Full-text search across all notebook paragraphs |
-| `get_notebook` | Get full notebook details including paragraphs, code, and output |
+| `list_notebooks` | List notebooks, with optional `name_filter` and `limit` (default 100) |
+| `search_notebooks` | Full-text search across all notebook paragraphs, with `max_results` (default 20) |
+| `get_notebook` | Get notebook overview with all paragraph code, titles, and status (no output) |
 | `list_paragraphs` | List paragraph metadata (index, id, title, status) without code or output |
-| `get_paragraph` | Get full content of a single paragraph (code and output) |
+| `get_paragraph` | Get full content of a single paragraph (code, output, and dynamic forms) |
 | `get_paragraph_code` | Get only the code/text content of a paragraph, without output or forms (saves tokens) |
 | `get_paragraph_forms` | Get dynamic form definitions and current parameter values for a paragraph |
 | `update_paragraph_forms` | Update dynamic form values without re-executing (preserves chart settings) |
 | `update_paragraph_config` | Update paragraph visualization/chart config (graph type, column mappings, display settings) |
 | `create_notebook` | Create a new empty notebook |
 | `add_paragraph` | Add a new paragraph to an existing notebook |
-| `run_paragraph` | Run a paragraph synchronously and return the result (preserves chart settings when using params) |
-| `run_all_paragraphs` | Run all paragraphs in a notebook and wait for completion (preserves chart settings when using params) |
+| `run_paragraph` | Run a paragraph synchronously and return the result (preserves chart settings) |
+| `run_all_paragraphs` | Run all paragraphs in a notebook and wait for completion (preserves chart settings) |
 | `get_paragraph_status` | Check execution status of a paragraph |
+| `stop_paragraph` | Stop a running paragraph (cancel long-running or stuck queries) |
 | `get_notebook_permissions` | Get permission information for a notebook (owners, writers, readers) |
 | `set_notebook_permissions` | Set owners, writers, and readers for a notebook |
+| `export_notebook` | Export notebook as JSON for backup or cross-server migration |
+| `import_notebook` | Import a previously exported notebook JSON |
 
 For safety, delete and edit operations on existing paragraphs are deliberately not exposed.
 
@@ -132,9 +135,9 @@ ZEPPELIN_PASSWORD=your-password \
 uv run server.py
 ```
 
-If configuration is correct the process will start and wait for input on stdin (this is normal — it communicates via the MCP stdio protocol). Press `Ctrl+C` to stop.
+If configuration is correct the server will authenticate with Zeppelin and then wait for input on stdin (this is normal — it communicates via the MCP stdio protocol). Press `Ctrl+C` to stop.
 
-If environment variables are missing you will see a `ValueError` immediately.
+If environment variables are missing you will see a `ValueError` immediately. If credentials are wrong, you will see an authentication error at startup.
 
 ### 2. Test tools with MCP Inspector
 
@@ -148,7 +151,7 @@ mcp dev server.py
 ```
 
 This opens a browser where you can:
-- See all 16 registered tools
+- See all 19 registered tools
 - Call `list_notebooks` to verify the connection to Zeppelin is working
 - Test `search_notebooks` with a keyword
 - Try `get_notebook` with a notebook ID from the list
@@ -159,7 +162,7 @@ This opens a browser where you can:
 After adding the server to `claude_desktop_config.json` and restarting Claude Desktop:
 
 1. Open a new conversation
-2. Click the hammer icon at the bottom of the input box — you should see all 16 Zeppelin tools listed
+2. Click the hammer icon at the bottom of the input box — you should see all 19 Zeppelin tools listed
 3. Ask Claude: *"List all my Zeppelin notebooks"*
 4. Claude will call `list_notebooks` and show the results
 
@@ -197,6 +200,8 @@ If all steps succeed, the server is fully operational.
 |---------|-------|-----|
 | `ValueError: ZEPPELIN_BASE_URL environment variable is required` | Missing env vars | Set all three env vars (`ZEPPELIN_BASE_URL`, `ZEPPELIN_USERNAME`, `ZEPPELIN_PASSWORD`) |
 | `httpx.ConnectError` | Zeppelin is unreachable | Verify `ZEPPELIN_BASE_URL` is correct and Zeppelin is running |
-| `HTTP 401/403` on every call | Wrong credentials | Check `ZEPPELIN_USERNAME` and `ZEPPELIN_PASSWORD` |
+| Authentication error at startup | Wrong credentials | Check `ZEPPELIN_USERNAME` and `ZEPPELIN_PASSWORD` |
 | Tools don't appear in Claude Desktop | Config error or server crash | Check the MCP log files and verify `claude_desktop_config.json` syntax |
 | Tools don't appear in Claude Code | Server not registered | Run `claude mcp list` and re-add if missing |
+
+**Note:** The server automatically re-authenticates when sessions expire (including HTTP 302 redirects to the login page). You should not need to manually restart the server due to session timeouts.
