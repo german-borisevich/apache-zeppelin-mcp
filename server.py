@@ -288,6 +288,10 @@ class ZeppelinClient:
         self._authenticated = False
 
     async def login(self) -> None:
+        if not (self.username and self.password):
+            self._authenticated = True
+            logger.info("No credentials configured, skipping login (anonymous access)")
+            return
         resp = await self.client.post(
             f"{self.base_url}/api/login",
             data={"userName": self.username, "password": self.password},
@@ -306,7 +310,7 @@ class ZeppelinClient:
         url = f"{self.base_url}{path}"
         resp = await self.client.request(method, url, json=json, params=params)
 
-        if resp.status_code in (401, 403):
+        if resp.status_code in (401, 403) and self.username and self.password:
             logger.info("Session expired, re-authenticating")
             await self.login()
             resp = await self.client.request(method, url, json=json, params=params)
@@ -331,10 +335,6 @@ class AppContext:
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     if not ZEPPELIN_BASE_URL:
         raise ValueError("ZEPPELIN_BASE_URL environment variable is required")
-    if not ZEPPELIN_USERNAME:
-        raise ValueError("ZEPPELIN_USERNAME environment variable is required")
-    if not ZEPPELIN_PASSWORD:
-        raise ValueError("ZEPPELIN_PASSWORD environment variable is required")
     client = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWORD)
     try:
         yield AppContext(zeppelin=client)
@@ -699,6 +699,24 @@ async def update_paragraph_config(
     return ". ".join(parts) + "."
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
+@_tool_error_handler("deleting paragraph")
+async def delete_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
+    """Delete a paragraph from a notebook.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to delete
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    _check_status(await zeppelin.request(
+        "DELETE", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    return f"Deleted paragraph {paragraph_id}"
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("creating notebook")
 async def create_notebook(ctx: Context, name: str) -> str:
@@ -767,7 +785,7 @@ async def run_paragraph(
     max_rows: int = 50,
     include_html: bool = False,
 ) -> str:
-    """Run a paragraph synchronously and return the result.
+    """Run a paragraph and return the result. Output is persisted and visible in Zeppelin UI.
     Chart settings are saved/restored automatically around execution.
 
     By default, table output is limited to 50 rows and HTML output is omitted to save tokens.
@@ -786,19 +804,37 @@ async def run_paragraph(
     zeppelin = _get_zeppelin(ctx)
     saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
 
-    data = _check_status(await zeppelin.request(
-        "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}",
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
         json=_build_params_body(params),
     ))
 
+    # Poll until paragraph finishes
+    elapsed = 0.0
+    timeout = 600.0
+    poll_interval = 2.0
+    while elapsed < timeout:
+        status_data = _check_status(await zeppelin.request(
+            "GET", f"/api/notebook/job/{notebook_id}/{paragraph_id}"
+        ))
+        status = status_data.get("body", {}).get("status", "")
+        if status not in ("RUNNING", "PENDING", "READY"):
+            break
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
     if saved is not None:
-        await asyncio.sleep(0.5)
         await _restore_paragraph_config(zeppelin, notebook_id, paragraph_id, saved)
 
-    resp_body = data.get("body", {})
-    code = resp_body.get("code", "UNKNOWN")
+    para_data = _check_status(await zeppelin.request(
+        "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    p = para_data.get("body", {})
+    results = p.get("results", {})
+    code = results.get("code", "UNKNOWN")
     lines = [f"Status: {code}"]
-    lines.extend(_format_messages(resp_body.get("msg", []), include_html=include_html, limit_rows=max_rows))
+    if results.get("msg"):
+        lines.extend(_format_messages(results["msg"], include_html=include_html, limit_rows=max_rows))
     return _truncate("\n".join(lines))
 
 
