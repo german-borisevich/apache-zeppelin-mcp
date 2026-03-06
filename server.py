@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import html
+import json
 import os
 import logging
 import re
@@ -159,18 +160,23 @@ def _format_forms(paragraph: dict) -> list[str]:
 def _format_config(paragraph: dict) -> list[str]:
     """Format paragraph visualization config for display."""
     config = paragraph.get("config", {})
-    # Chart config can be in config.graph (dict) or config.results (list of dicts with "graph" key)
-    graph = config.get("graph", {})
-    if not graph:
-        results = config.get("results")
-        if isinstance(results, list) and results:
-            graph = results[0].get("graph", {})
-        elif isinstance(results, dict):
-            first = next(iter(results.values()), {})
-            if isinstance(first, dict):
-                graph = first.get("graph", {})
+
+    # Result-level graph is what the UI actually renders — check it first
+    result_graph = {}
+    results = config.get("results")
+    if isinstance(results, list) and results:
+        result_graph = results[0].get("graph", {})
+    elif isinstance(results, dict):
+        first = next(iter(results.values()), {})
+        if isinstance(first, dict):
+            result_graph = first.get("graph", {})
+
+    top_graph = config.get("graph", {})
+    graph = result_graph or top_graph
+
     if not graph:
         return []
+
     lines = ["Visualization:"]
     mode = graph.get("mode", "table")
     lines.append(f"  chart type: {mode}")
@@ -183,6 +189,16 @@ def _format_config(paragraph: dict) -> list[str]:
     col_width = config.get("colWidth")
     if col_width and col_width != 12:
         lines.append(f"  colWidth: {col_width}")
+
+    # Warn if top-level and result-level configs are out of sync
+    if result_graph and top_graph:
+        def _col_names(g, field):
+            return sorted(c.get("name", "") for c in g.get(field, []))
+        for field in ("keys", "groups", "values"):
+            if _col_names(result_graph, field) != _col_names(top_graph, field):
+                lines.append(f"  ⚠ WARNING: chart settings out of sync between config.graph and config.results — UI uses result-level config")
+                break
+
     return lines
 
 
@@ -197,15 +213,15 @@ async def _save_paragraph_state(
 ) -> dict | None:
     """Fetch paragraph data needed for config save/restore."""
     try:
-        data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
-        for p in data.get("body", {}).get("paragraphs", []):
-            if p.get("id") == paragraph_id:
-                logger.debug(
-                    "Saved state for paragraph %s, config keys: %s",
-                    paragraph_id, list(p.get("config", {}).keys()),
-                )
-                return p
-        return None
+        data = _check_status(await zeppelin.request(
+            "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+        ))
+        p = data.get("body", {})
+        logger.debug(
+            "Saved state for paragraph %s, config keys: %s",
+            paragraph_id, list(p.get("config", {}).keys()),
+        )
+        return p
     except Exception:
         logger.warning("Failed to save state for paragraph %s", paragraph_id, exc_info=True)
         return None
@@ -298,18 +314,22 @@ class ZeppelinClient:
         logger.info("Authenticated with Zeppelin")
 
     async def request(
-        self, method: str, path: str, json: Any = None, params: dict | None = None
+        self, method: str, path: str, json: Any = None, params: dict | None = None,
+        timeout: float | None = None,
     ) -> dict:
         if not self._authenticated:
             await self.login()
 
         url = f"{self.base_url}{path}"
-        resp = await self.client.request(method, url, json=json, params=params)
+        kw: dict[str, Any] = {"json": json, "params": params}
+        if timeout is not None:
+            kw["timeout"] = httpx.Timeout(timeout)
+        resp = await self.client.request(method, url, **kw)
 
         if resp.status_code in (401, 403):
             logger.info("Session expired, re-authenticating")
             await self.login()
-            resp = await self.client.request(method, url, json=json, params=params)
+            resp = await self.client.request(method, url, **kw)
 
         resp.raise_for_status()
         return resp.json()
@@ -673,7 +693,11 @@ async def update_paragraph_config(
             if results:
                 for result_data in results.values():
                     if isinstance(result_data, dict) and "graph" in result_data:
-                        result_data["graph"] = {**result_data["graph"], **user_graph}
+                        merged_result_graph = {**result_data["graph"], **user_graph}
+                        # Ensure mode is consistent with top-level
+                        if "mode" not in user_graph and "mode" in merged_graph:
+                            merged_result_graph["mode"] = merged_graph["mode"]
+                        result_data["graph"] = merged_result_graph
             else:
                 # No results entries — create one with the merged graph config
                 config["results"] = {"0": {"graph": {**merged_graph}}}
@@ -789,6 +813,7 @@ async def run_paragraph(
     data = _check_status(await zeppelin.request(
         "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}",
         json=_build_params_body(params),
+        timeout=300,
     ))
 
     if saved is not None:
@@ -947,6 +972,37 @@ async def set_notebook_permissions(
         f"  Runners: {', '.join(runners) if runners else '(none)'}",
     ]
     return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("exporting notebook")
+async def export_notebook(ctx: Context, notebook_id: str) -> str:
+    """Export notebook as JSON (for cross-server migration or backup).
+
+    Args:
+        notebook_id: The notebook ID to export
+    """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
+    data = _check_status(await zeppelin.request("GET", f"/api/notebook/export/{notebook_id}"))
+    return json.dumps(data.get("body", {}))
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("importing notebook")
+async def import_notebook(ctx: Context, notebook_json: str, new_name: str | None = None) -> str:
+    """Import a previously exported notebook JSON. Optionally rename it.
+
+    Args:
+        notebook_json: The full notebook JSON string from export_notebook
+        new_name: Optional new name/path for the imported notebook
+    """
+    zeppelin = _get_zeppelin(ctx)
+    body = json.loads(notebook_json)
+    if new_name:
+        body["name"] = new_name
+    data = _check_status(await zeppelin.request("POST", "/api/notebook/import", json=body))
+    return f"Imported notebook with id: {data.get('body', 'unknown')}"
 
 
 def main():
