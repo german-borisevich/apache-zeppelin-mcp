@@ -290,6 +290,39 @@ async def _wait_for_notebook_completion(
     return False
 
 
+async def _wait_for_paragraph_completion(
+    zeppelin: "ZeppelinClient",
+    notebook_id: str,
+    paragraph_id: str,
+    ctx: Context | None = None,
+    timeout: float = 600.0,
+    poll_interval: float = 2.0,
+) -> dict:
+    """Poll paragraph job status until it finishes or timeout. Returns status body."""
+    deadline = time.monotonic() + timeout
+    while True:
+        elapsed = timeout - (deadline - time.monotonic())
+        if time.monotonic() >= deadline:
+            break
+        try:
+            data = _check_status(await zeppelin.request(
+                "GET", f"/api/notebook/job/{notebook_id}/{paragraph_id}"
+            ))
+            body = data.get("body", {})
+            status = body.get("status", "")
+            if status not in ("RUNNING", "PENDING", "READY"):
+                if ctx:
+                    await ctx.report_progress(elapsed, timeout)
+                return body
+            if ctx:
+                await ctx.report_progress(elapsed, timeout)
+        except Exception:
+            logger.warning("Error polling paragraph %s status", paragraph_id, exc_info=True)
+        await asyncio.sleep(poll_interval)
+    logger.warning("Timeout waiting for paragraph %s after %.0fs", paragraph_id, timeout)
+    return {"status": "TIMEOUT"}
+
+
 def _get_zeppelin(ctx: Context) -> "ZeppelinClient":
     """Extract ZeppelinClient from the lifespan context."""
     return ctx.request_context.lifespan_context.zeppelin
