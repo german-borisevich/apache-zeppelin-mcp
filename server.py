@@ -213,7 +213,7 @@ def _build_params_body(params: Optional[dict[str, Any]]) -> dict[str, Any] | Non
 async def _save_paragraph_state(
     zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str
 ) -> dict | None:
-    """Fetch paragraph data needed for config save/restore."""
+    """Fetch current paragraph data (for backup, config merge, or form update)."""
     try:
         data = _check_status(await zeppelin.request(
             "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
