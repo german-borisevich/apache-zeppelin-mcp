@@ -201,7 +201,7 @@ If all steps succeed, the server is fully operational.
 
 When `update_paragraph` or `delete_paragraph` modifies existing content, the previous version is automatically saved to a backup notebook before the change is applied.
 
-- **Backup location:** `Users/<username>/~Backups/<notebook_name>_<notebook_id>_backup`
+- **Backup location:** `Users/<username>/~Backups/<original_notebook_path>/<notebook_name>_<notebook_id>_backup` (mirrors the original path)
 - **What triggers a backup:** `update_paragraph` (only when text actually changes), `delete_paragraph` (always)
 - **What doesn't trigger a backup:** `move_paragraph`, title-only changes, `add_paragraph`
 - **Protection:** All mutating tools (add, run, update, delete, move, set permissions) are blocked from operating on `~Backups` notebooks. Read-only tools work normally on backup notebooks.

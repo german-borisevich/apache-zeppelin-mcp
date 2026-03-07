@@ -311,8 +311,14 @@ async def _backup_paragraph(
     zeppelin: "ZeppelinClient", notebook_id: str, notebook_path: str,
     paragraph_id: str, paragraph_data: dict, operation: str = "EDIT",
 ) -> None:
-    notebook_name = notebook_path.rsplit("/", 1)[-1] if "/" in notebook_path else notebook_path
-    backup_path = f"Users/{ZEPPELIN_USERNAME}/~Backups/{notebook_name}_{notebook_id}_backup"
+    clean_path = notebook_path.lstrip("/")
+    parent = clean_path.rsplit("/", 1)[0] if "/" in clean_path else ""
+    notebook_name = clean_path.rsplit("/", 1)[-1]
+    backup_name = f"{notebook_name}_{notebook_id}_backup"
+    if parent:
+        backup_path = f"Users/{ZEPPELIN_USERNAME}/~Backups/{parent}/{backup_name}"
+    else:
+        backup_path = f"Users/{ZEPPELIN_USERNAME}/~Backups/{backup_name}"
 
     # Find or create backup notebook
     backup_notebook_id = None
@@ -334,21 +340,34 @@ async def _backup_paragraph(
 
     # Build backup paragraph
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    backup_title = f"[{timestamp} | {operation}] {paragraph_id}"
-
-    old_text = paragraph_data.get("text", "")
     old_title = paragraph_data.get("title", "")
     if old_title:
-        backup_text = f"// Original title: {old_title}\n{old_text}"
+        backup_title = f"[{timestamp} | {operation}] {old_title} ({paragraph_id})"
     else:
-        backup_text = old_text
+        backup_title = f"[{timestamp} | {operation}] {paragraph_id}"
 
-    body: dict[str, Any] = {"text": backup_text, "title": backup_title}
+    old_text = paragraph_data.get("text", "")
+
+    body: dict[str, Any] = {"text": old_text, "title": backup_title}
     result = _check_status(
         await zeppelin.request("POST", f"/api/notebook/{backup_notebook_id}/paragraph", json=body)
     )
-    if not result.get("body"):
+    backup_para_id = result.get("body")
+    if not backup_para_id:
         raise ToolError("Failed to create backup paragraph")
+
+    # Make title visible
+    try:
+        saved = await _save_paragraph_state(zeppelin, backup_notebook_id, backup_para_id)
+        cfg = saved.get("config", {}) if saved else {}
+        cfg["title"] = True
+        await zeppelin.request(
+            "PUT",
+            f"/api/notebook/{backup_notebook_id}/paragraph/{backup_para_id}/config",
+            json=cfg,
+        )
+    except Exception:
+        logger.warning("Failed to set title visibility for backup paragraph %s", backup_para_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
