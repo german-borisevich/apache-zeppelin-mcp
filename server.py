@@ -1088,6 +1088,37 @@ async def run_paragraph(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("running paragraph async")
+async def run_paragraph_async(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_id: str,
+    params: Optional[dict[str, Any]] = None,
+) -> str:
+    """Start paragraph execution and return immediately without waiting for results.
+    Use this to run multiple paragraphs in parallel, then check status with get_paragraph_status
+    and read results with get_paragraph.
+
+    Chart/visualization settings are preserved automatically.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to run
+        params: Optional dict of dynamic form values, e.g. {"city": "Seoul"}.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
+        json=_build_params_body(params),
+    ))
+    return f"Started paragraph {paragraph_id}. Use get_paragraph_status to check completion."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("running all paragraphs")
 async def run_all_paragraphs(
     ctx: Context,
