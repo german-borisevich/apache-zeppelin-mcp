@@ -1095,7 +1095,7 @@ async def run_all_paragraphs(
     params: Optional[dict[str, Any]] = None,
 ) -> str:
     """Run all paragraphs in a notebook and wait for completion.
-    Chart settings are saved/restored automatically around execution.
+    Uses the async job endpoint which preserves chart/visualization settings.
 
     Args:
         notebook_id: The notebook ID to run
@@ -1103,13 +1103,7 @@ async def run_all_paragraphs(
     """
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
-    nb_data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
-    saved_paragraphs: list[dict] = []
-    if nb_data.get("status") == "OK":
-        nb_path = nb_data.get("body", {}).get("name", "")
-        if "/~Backups/" in nb_path or nb_path.startswith("~Backups/"):
-            raise ToolError("Cannot modify notebooks in ~Backups — these are protected backup notebooks")
-        saved_paragraphs = nb_data.get("body", {}).get("paragraphs", [])
+    await _check_backup_protection(zeppelin, notebook_id)
 
     _check_status(await zeppelin.request(
         "POST", f"/api/notebook/job/{notebook_id}",
@@ -1118,18 +1112,8 @@ async def run_all_paragraphs(
 
     completed = await _wait_for_notebook_completion(zeppelin, notebook_id, ctx=ctx)
 
-    restored = 0
-    for p in saved_paragraphs:
-        pid = p.get("id")
-        if pid and p.get("config"):
-            await _restore_paragraph_config(zeppelin, notebook_id, pid, p)
-            restored += 1
-
     status = "completed" if completed else "timed out"
-    return (
-        f"Execution of all paragraphs in notebook {notebook_id} {status}. "
-        f"Restored chart settings for {restored} paragraphs."
-    )
+    return f"Execution of all paragraphs in notebook {notebook_id} {status}."
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
