@@ -229,33 +229,6 @@ async def _save_paragraph_state(
         return None
 
 
-async def _restore_paragraph_config(
-    zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str, saved: dict
-) -> None:
-    """Restore paragraph config (chart/visualization settings)."""
-    try:
-        config = saved.get("config")
-        if not config:
-            return
-
-        # If the saved config had no results, preserve results created during execution
-        if not config.get("results"):
-            current = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-            if current:
-                new_results = current.get("config", {}).get("results")
-                if new_results:
-                    config["results"] = new_results
-
-        await zeppelin.request(
-            "PUT",
-            f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-            json=config,
-        )
-        logger.debug("Restored config for paragraph %s", paragraph_id)
-    except Exception:
-        logger.warning("Failed to restore config for paragraph %s", paragraph_id, exc_info=True)
-
-
 async def _wait_for_notebook_completion(
     zeppelin: "ZeppelinClient",
     notebook_id: str,
