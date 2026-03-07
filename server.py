@@ -1042,8 +1042,8 @@ async def run_paragraph(
     max_rows: int = 50,
     include_html: bool = False,
 ) -> str:
-    """Run a paragraph synchronously and return the result.
-    Chart settings are saved/restored automatically around execution.
+    """Run a paragraph and return the result.
+    Uses the async job endpoint which preserves chart/visualization settings.
 
     By default, table output is limited to 50 rows and HTML output is omitted to save tokens.
     Set max_rows=0 for unlimited rows when you need full results for analysis.
@@ -1062,21 +1062,28 @@ async def run_paragraph(
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
     await _check_backup_protection(zeppelin, notebook_id)
-    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
 
-    data = _check_status(await zeppelin.request(
-        "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}",
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
         json=_build_params_body(params),
-        timeout=300,
     ))
 
-    if saved is not None:
-        await _restore_paragraph_config(zeppelin, notebook_id, paragraph_id, saved)
+    job_body = await _wait_for_paragraph_completion(
+        zeppelin, notebook_id, paragraph_id, ctx=ctx, timeout=600.0,
+    )
+    job_status = job_body.get("status", "UNKNOWN")
 
-    resp_body = data.get("body", {})
-    code = resp_body.get("code", "UNKNOWN")
+    # Fetch full paragraph to get results
+    data = _check_status(await zeppelin.request(
+        "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    p = data.get("body", {})
+    results = p.get("results", {})
+    code = results.get("code", job_status)
+
     lines = [f"Status: {code}"]
-    lines.extend(_format_messages(resp_body.get("msg", []), include_html=include_html, limit_rows=max_rows))
+    if results.get("msg"):
+        lines.extend(_format_messages(results["msg"], include_html=include_html, limit_rows=max_rows))
     return _truncate("\n".join(lines))
 
 
