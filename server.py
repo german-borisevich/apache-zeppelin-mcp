@@ -300,11 +300,21 @@ async def _get_notebook_path(zeppelin: "ZeppelinClient", notebook_id: str) -> st
     return data.get("body", {}).get("name", "")
 
 
+_notebook_path_cache: dict[str, str] = {}
+
+
 async def _check_backup_protection(zeppelin: "ZeppelinClient", notebook_id: str) -> str:
-    path = await _get_notebook_path(zeppelin, notebook_id)
+    if notebook_id in _notebook_path_cache:
+        path = _notebook_path_cache[notebook_id]
+    else:
+        path = await _get_notebook_path(zeppelin, notebook_id)
+        _notebook_path_cache[notebook_id] = path
     if "/~Backups/" in path or path.startswith("~Backups/"):
         raise ToolError("Cannot modify notebooks in ~Backups — these are protected backup notebooks")
     return path
+
+
+_backup_notebook_id_cache: dict[str, str] = {}
 
 
 async def _backup_paragraph(
@@ -320,15 +330,17 @@ async def _backup_paragraph(
     else:
         backup_path = f"Users/{ZEPPELIN_USERNAME}/~Backups/{backup_name}"
 
-    # Find or create backup notebook
-    backup_notebook_id = None
-    data = _check_status(await zeppelin.request("GET", "/api/notebook"))
-    for nb in data.get("body", []):
-        nb_path = nb.get("path", nb.get("name", ""))
-        # Normalize: path may have leading /
-        if nb_path.lstrip("/") == backup_path:
-            backup_notebook_id = nb.get("id")
-            break
+    # Find or create backup notebook (with cache)
+    backup_notebook_id = _backup_notebook_id_cache.get(backup_path)
+
+    if not backup_notebook_id:
+        data = _check_status(await zeppelin.request("GET", "/api/notebook"))
+        for nb in data.get("body", []):
+            nb_path = nb.get("path", nb.get("name", ""))
+            # Normalize: path may have leading /
+            if nb_path.lstrip("/") == backup_path:
+                backup_notebook_id = nb.get("id")
+                break
 
     if not backup_notebook_id:
         create_data = _check_status(
@@ -337,6 +349,8 @@ async def _backup_paragraph(
         backup_notebook_id = create_data.get("body")
         if not backup_notebook_id:
             raise ToolError("Failed to create backup notebook")
+
+    _backup_notebook_id_cache[backup_path] = backup_notebook_id
 
     # Build backup paragraph
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -356,15 +370,12 @@ async def _backup_paragraph(
     if not backup_para_id:
         raise ToolError("Failed to create backup paragraph")
 
-    # Make title visible
+    # Make title visible (PUT config merges, so we only need to send the title field)
     try:
-        saved = await _save_paragraph_state(zeppelin, backup_notebook_id, backup_para_id)
-        cfg = saved.get("config", {}) if saved else {}
-        cfg["title"] = True
         await zeppelin.request(
             "PUT",
             f"/api/notebook/{backup_notebook_id}/paragraph/{backup_para_id}/config",
-            json=cfg,
+            json={"title": True},
         )
     except Exception:
         logger.warning("Failed to set title visibility for backup paragraph %s", backup_para_id, exc_info=True)
@@ -720,7 +731,6 @@ async def update_paragraph_forms(
 
     body: dict[str, Any] = {
         "text": saved.get("text", ""),
-        "config": saved.get("config", {}),
         "settings": settings,
     }
     title = saved.get("title")
@@ -864,13 +874,10 @@ async def update_paragraph(
 
     if title is not None:
         try:
-            current = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-            cfg = current.get("config", {}) if current else {}
-            cfg["title"] = True
             await zeppelin.request(
                 "PUT",
                 f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-                json=cfg,
+                json={"title": True},
             )
         except Exception:
             logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
@@ -981,13 +988,10 @@ async def add_paragraph(
 
     if title is not None and paragraph_id != "unknown":
         try:
-            saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-            cfg = saved.get("config", {}) if saved else {}
-            cfg["title"] = True
             await zeppelin.request(
                 "PUT",
                 f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-                json=cfg,
+                json={"title": True},
             )
         except Exception:
             logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
