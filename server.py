@@ -7,6 +7,7 @@ import logging
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -292,6 +293,62 @@ async def _wait_for_notebook_completion(
 def _get_zeppelin(ctx: Context) -> "ZeppelinClient":
     """Extract ZeppelinClient from the lifespan context."""
     return ctx.request_context.lifespan_context.zeppelin
+
+
+async def _get_notebook_path(zeppelin: "ZeppelinClient", notebook_id: str) -> str:
+    data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
+    return data.get("body", {}).get("name", "")
+
+
+async def _check_backup_protection(zeppelin: "ZeppelinClient", notebook_id: str) -> str:
+    path = await _get_notebook_path(zeppelin, notebook_id)
+    if "/~Backups/" in path or path.startswith("~Backups/"):
+        raise ToolError("Cannot modify notebooks in ~Backups — these are protected backup notebooks")
+    return path
+
+
+async def _backup_paragraph(
+    zeppelin: "ZeppelinClient", notebook_id: str, notebook_path: str,
+    paragraph_id: str, paragraph_data: dict, operation: str = "EDIT",
+) -> None:
+    notebook_name = notebook_path.rsplit("/", 1)[-1] if "/" in notebook_path else notebook_path
+    backup_path = f"Users/{ZEPPELIN_USERNAME}/~Backups/{notebook_name}_{notebook_id}_backup"
+
+    # Find or create backup notebook
+    backup_notebook_id = None
+    data = _check_status(await zeppelin.request("GET", "/api/notebook"))
+    for nb in data.get("body", []):
+        nb_path = nb.get("path", nb.get("name", ""))
+        # Normalize: path may have leading /
+        if nb_path.lstrip("/") == backup_path:
+            backup_notebook_id = nb.get("id")
+            break
+
+    if not backup_notebook_id:
+        create_data = _check_status(
+            await zeppelin.request("POST", "/api/notebook", json={"name": backup_path})
+        )
+        backup_notebook_id = create_data.get("body")
+        if not backup_notebook_id:
+            raise ToolError("Failed to create backup notebook")
+
+    # Build backup paragraph
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    backup_title = f"[{timestamp} | {operation}] {paragraph_id}"
+
+    old_text = paragraph_data.get("text", "")
+    old_title = paragraph_data.get("title", "")
+    if old_title:
+        backup_text = f"// Original title: {old_title}\n{old_text}"
+    else:
+        backup_text = old_text
+
+    body: dict[str, Any] = {"text": backup_text, "title": backup_title}
+    result = _check_status(
+        await zeppelin.request("POST", f"/api/notebook/{backup_notebook_id}/paragraph", json=body)
+    )
+    if not result.get("body"):
+        raise ToolError("Failed to create backup paragraph")
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +689,7 @@ async def update_paragraph_forms(
     _validate_id(notebook_id, "notebook_id")
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
     saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
     if saved is None:
         raise ToolError(f"Could not fetch paragraph {paragraph_id}")
@@ -688,6 +746,7 @@ async def update_paragraph_config(
     _validate_id(notebook_id, "notebook_id")
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
     saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
     if saved:
         current_config = saved.get("config", {})
@@ -748,6 +807,114 @@ async def update_paragraph_config(
     return ". ".join(parts) + "."
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
+@_tool_error_handler("updating paragraph")
+async def update_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_id: str,
+    text: str,
+    title: Optional[str] = None,
+) -> str:
+    """Update paragraph code/text. Previous content is automatically backed up before changes.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to update
+        text: The new code/content for the paragraph
+        title: Optional new title for the paragraph
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    notebook_path = await _check_backup_protection(zeppelin, notebook_id)
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved is None:
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
+
+    old_text = saved.get("text", "")
+    if old_text != text:
+        await _backup_paragraph(zeppelin, notebook_id, notebook_path, paragraph_id, saved, "EDIT")
+
+    body: dict[str, Any] = {"text": text}
+    if title is not None:
+        body["title"] = title
+    await zeppelin.request(
+        "PUT", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}", json=body
+    )
+
+    if title is not None:
+        try:
+            current = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+            cfg = current.get("config", {}) if current else {}
+            cfg["title"] = True
+            await zeppelin.request(
+                "PUT",
+                f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+                json=cfg,
+            )
+        except Exception:
+            logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
+
+    return f"Updated paragraph {paragraph_id}."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
+@_tool_error_handler("deleting paragraph")
+async def delete_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_id: str,
+) -> str:
+    """Delete a paragraph. Its content is automatically backed up before deletion.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to delete
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    notebook_path = await _check_backup_protection(zeppelin, notebook_id)
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved is None:
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
+
+    await _backup_paragraph(zeppelin, notebook_id, notebook_path, paragraph_id, saved, "DELETE")
+
+    _check_status(await zeppelin.request(
+        "DELETE", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    return f"Deleted paragraph {paragraph_id}. Previous content backed up."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("moving paragraph")
+async def move_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_id: str,
+    new_index: int,
+) -> str:
+    """Move a paragraph to a new position within the same notebook.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to move
+        new_index: The target position index (0-based)
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    if new_index < 0:
+        raise ToolError("new_index must be >= 0")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/move/{new_index}"
+    ))
+    return f"Moved paragraph {paragraph_id} to index {new_index}."
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("creating notebook")
 async def create_notebook(ctx: Context, name: str) -> str:
@@ -756,6 +923,8 @@ async def create_notebook(ctx: Context, name: str) -> str:
     Args:
         name: Full path for the new notebook, e.g. "Users/john/ProjectName/Notebook Title"
     """
+    if "/~Backups/" in name or name.startswith("~Backups/"):
+        raise ToolError("Cannot create notebooks in ~Backups — these are protected backup notebooks")
     zeppelin = _get_zeppelin(ctx)
     data = _check_status(await zeppelin.request("POST", "/api/notebook", json={"name": name}))
     return f"Created notebook with id: {data.get('body', 'unknown')}"
@@ -780,6 +949,7 @@ async def add_paragraph(
     """
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
     body: dict[str, Any] = {"text": text}
     if title is not None:
         body["title"] = title
@@ -835,6 +1005,7 @@ async def run_paragraph(
     _validate_id(notebook_id, "notebook_id")
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
     saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
 
     data = _check_status(await zeppelin.request(
@@ -872,6 +1043,9 @@ async def run_all_paragraphs(
     nb_data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
     saved_paragraphs: list[dict] = []
     if nb_data.get("status") == "OK":
+        nb_path = nb_data.get("body", {}).get("name", "")
+        if "/~Backups/" in nb_path or nb_path.startswith("~Backups/"):
+            raise ToolError("Cannot modify notebooks in ~Backups — these are protected backup notebooks")
         saved_paragraphs = nb_data.get("body", {}).get("paragraphs", [])
 
     _check_status(await zeppelin.request(
@@ -1005,6 +1179,7 @@ async def set_notebook_permissions(
     if runners is None:
         runners = []
     zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
     _check_status(await zeppelin.request(
         "PUT",
         f"/api/notebook/{notebook_id}/permissions",
@@ -1048,6 +1223,9 @@ async def import_notebook(ctx: Context, notebook_json: str, new_name: str | None
     body = json.loads(notebook_json)
     if new_name:
         body["name"] = new_name
+    import_name = body.get("name", "")
+    if "/~Backups/" in import_name or import_name.startswith("~Backups/"):
+        raise ToolError("Cannot import notebooks into ~Backups — these are protected backup notebooks")
     data = _check_status(await zeppelin.request("POST", "/api/notebook/import", json=body))
     return f"Imported notebook with id: {data.get('body', 'unknown')}"
 

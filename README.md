@@ -21,6 +21,9 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `get_paragraph_forms` | Get dynamic form definitions and current parameter values for a paragraph |
 | `update_paragraph_forms` | Update dynamic form values without re-executing (preserves chart settings) |
 | `update_paragraph_config` | Update paragraph visualization/chart config (graph type, column mappings, display settings) |
+| `update_paragraph` | Update paragraph code/text with automatic backup of previous version |
+| `delete_paragraph` | Delete a paragraph with automatic backup of its content |
+| `move_paragraph` | Move a paragraph to a new position within the same notebook |
 | `create_notebook` | Create a new empty notebook |
 | `add_paragraph` | Add a new paragraph to an existing notebook |
 | `run_paragraph` | Run a paragraph synchronously and return the result (preserves chart settings) |
@@ -32,7 +35,7 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `export_notebook` | Export notebook as JSON for backup or cross-server migration |
 | `import_notebook` | Import a previously exported notebook JSON |
 
-For safety, delete and edit operations on existing paragraphs are deliberately not exposed.
+Edit and delete operations automatically back up previous paragraph content to protected `~Backups` notebooks before making changes.
 
 ## Setup for Claude Desktop
 
@@ -151,7 +154,7 @@ mcp dev server.py
 ```
 
 This opens a browser where you can:
-- See all 19 registered tools
+- See all 22 registered tools
 - Call `list_notebooks` to verify the connection to Zeppelin is working
 - Test `search_notebooks` with a keyword
 - Try `get_notebook` with a notebook ID from the list
@@ -162,7 +165,7 @@ This opens a browser where you can:
 After adding the server to `claude_desktop_config.json` and restarting Claude Desktop:
 
 1. Open a new conversation
-2. Click the hammer icon at the bottom of the input box — you should see all 19 Zeppelin tools listed
+2. Click the hammer icon at the bottom of the input box — you should see all 22 Zeppelin tools listed
 3. Ask Claude: *"List all my Zeppelin notebooks"*
 4. Claude will call `list_notebooks` and show the results
 
@@ -193,6 +196,18 @@ Ask the agent to run through this sequence to fully verify all tools:
 ```
 
 If all steps succeed, the server is fully operational.
+
+## Automatic Backup
+
+When `update_paragraph` or `delete_paragraph` modifies existing content, the previous version is automatically saved to a backup notebook before the change is applied.
+
+- **Backup location:** `Users/<username>/~Backups/<notebook_name>_<notebook_id>_backup`
+- **What triggers a backup:** `update_paragraph` (only when text actually changes), `delete_paragraph` (always)
+- **What doesn't trigger a backup:** `move_paragraph`, title-only changes, `add_paragraph`
+- **Protection:** All mutating tools (add, run, update, delete, move, set permissions) are blocked from operating on `~Backups` notebooks. Read-only tools work normally on backup notebooks.
+- **Backup paragraph titles** include a UTC timestamp and operation label, e.g. `[2025-01-15 14:30 UTC | EDIT] paragraph_20250115-143012_123456`
+
+If backup creation fails, the destructive operation is aborted — no data is lost.
 
 ## Troubleshooting
 
