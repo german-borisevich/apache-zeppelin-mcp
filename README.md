@@ -35,6 +35,7 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `set_notebook_permissions` | Set owners, writers, and readers for a notebook |
 | `export_notebook` | Export notebook as JSON for backup or cross-server migration |
 | `import_notebook` | Import a previously exported notebook JSON |
+| `clone_notebook` | Clone an existing notebook with optional rename |
 
 Edit and delete operations automatically back up previous paragraph content to protected `~Backups` notebooks before making changes.
 
@@ -155,7 +156,7 @@ mcp dev server.py
 ```
 
 This opens a browser where you can:
-- See all 23 registered tools
+- See all 24 registered tools
 - Call `list_notebooks` to verify the connection to Zeppelin is working
 - Test `search_notebooks` with a keyword
 - Try `get_notebook` with a notebook ID from the list
@@ -166,7 +167,7 @@ This opens a browser where you can:
 After adding the server to `claude_desktop_config.json` and restarting Claude Desktop:
 
 1. Open a new conversation
-2. Click the hammer icon at the bottom of the input box — you should see all 23 Zeppelin tools listed
+2. Click the hammer icon at the bottom of the input box — you should see all 24 Zeppelin tools listed
 3. Ask Claude: *"List all my Zeppelin notebooks"*
 4. Claude will call `list_notebooks` and show the results
 
