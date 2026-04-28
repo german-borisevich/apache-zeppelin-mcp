@@ -1281,6 +1281,29 @@ async def import_notebook(ctx: Context, notebook_json: str, new_name: str | None
     return f"Imported notebook with id: {data.get('body', 'unknown')}"
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("cloning notebook")
+async def clone_notebook(ctx: Context, notebook_id: str, new_name: str | None = None) -> str:
+    """Clone an existing notebook. Optionally rename the copy.
+
+    Args:
+        notebook_id: The notebook ID to clone
+        new_name: Optional full path/name for the cloned notebook (e.g. "Users/john/Project/Copy").
+                  If omitted, Zeppelin auto-generates a name in the source's parent folder.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if new_name and ("/~Backups/" in new_name or new_name.startswith("~Backups/")):
+        raise ToolError("Cannot clone notebooks into ~Backups — these are protected backup notebooks")
+    zeppelin = _get_zeppelin(ctx)
+    if not new_name:
+        # Without an explicit new_name, Zeppelin auto-names the clone in the source's
+        # parent folder — which would land in ~Backups if the source is there.
+        await _check_backup_protection(zeppelin, notebook_id)
+    body = {"name": new_name} if new_name else None
+    data = _check_status(await zeppelin.request("POST", f"/api/notebook/{notebook_id}", json=body))
+    return f"Cloned notebook with id: {data.get('body', 'unknown')}"
+
+
 def main():
     mcp.run(transport="stdio")
 
