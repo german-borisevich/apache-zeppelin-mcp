@@ -213,7 +213,7 @@ def _build_params_body(params: Optional[dict[str, Any]]) -> dict[str, Any] | Non
 async def _save_paragraph_state(
     zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str
 ) -> dict | None:
-    """Fetch paragraph data needed for config save/restore."""
+    """Fetch current paragraph data (for backup, config merge, or form update)."""
     try:
         data = _check_status(await zeppelin.request(
             "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
@@ -227,33 +227,6 @@ async def _save_paragraph_state(
     except Exception:
         logger.warning("Failed to save state for paragraph %s", paragraph_id, exc_info=True)
         return None
-
-
-async def _restore_paragraph_config(
-    zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str, saved: dict
-) -> None:
-    """Restore paragraph config (chart/visualization settings)."""
-    try:
-        config = saved.get("config")
-        if not config:
-            return
-
-        # If the saved config had no results, preserve results created during execution
-        if not config.get("results"):
-            current = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-            if current:
-                new_results = current.get("config", {}).get("results")
-                if new_results:
-                    config["results"] = new_results
-
-        await zeppelin.request(
-            "PUT",
-            f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-            json=config,
-        )
-        logger.debug("Restored config for paragraph %s", paragraph_id)
-    except Exception:
-        logger.warning("Failed to restore config for paragraph %s", paragraph_id, exc_info=True)
 
 
 async def _wait_for_notebook_completion(
@@ -288,6 +261,39 @@ async def _wait_for_notebook_completion(
         await asyncio.sleep(poll_interval)
     logger.warning("Timeout waiting for notebook %s after %.0fs", notebook_id, timeout)
     return False
+
+
+async def _wait_for_paragraph_completion(
+    zeppelin: "ZeppelinClient",
+    notebook_id: str,
+    paragraph_id: str,
+    ctx: Context | None = None,
+    timeout: float = 600.0,
+    poll_interval: float = 2.0,
+) -> dict:
+    """Poll paragraph job status until it finishes or timeout. Returns status body."""
+    deadline = time.monotonic() + timeout
+    while True:
+        elapsed = timeout - (deadline - time.monotonic())
+        if time.monotonic() >= deadline:
+            break
+        try:
+            data = _check_status(await zeppelin.request(
+                "GET", f"/api/notebook/job/{notebook_id}/{paragraph_id}"
+            ))
+            body = data.get("body", {})
+            status = body.get("status", "")
+            if status not in ("RUNNING", "PENDING", "READY"):
+                if ctx:
+                    await ctx.report_progress(elapsed, timeout)
+                return body
+            if ctx:
+                await ctx.report_progress(elapsed, timeout)
+        except Exception:
+            logger.warning("Error polling paragraph %s status", paragraph_id, exc_info=True)
+        await asyncio.sleep(poll_interval)
+    logger.warning("Timeout waiting for paragraph %s after %.0fs", paragraph_id, timeout)
+    return {"status": "TIMEOUT"}
 
 
 def _get_zeppelin(ctx: Context) -> "ZeppelinClient":
@@ -1009,8 +1015,8 @@ async def run_paragraph(
     max_rows: int = 50,
     include_html: bool = False,
 ) -> str:
-    """Run a paragraph synchronously and return the result.
-    Chart settings are saved/restored automatically around execution.
+    """Run a paragraph and return the result.
+    Uses the async job endpoint which preserves chart/visualization settings.
 
     By default, table output is limited to 50 rows and HTML output is omitted to save tokens.
     Set max_rows=0 for unlimited rows when you need full results for analysis.
@@ -1029,22 +1035,60 @@ async def run_paragraph(
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
     await _check_backup_protection(zeppelin, notebook_id)
-    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
 
-    data = _check_status(await zeppelin.request(
-        "POST", f"/api/notebook/run/{notebook_id}/{paragraph_id}",
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
         json=_build_params_body(params),
-        timeout=300,
     ))
 
-    if saved is not None:
-        await _restore_paragraph_config(zeppelin, notebook_id, paragraph_id, saved)
+    job_body = await _wait_for_paragraph_completion(
+        zeppelin, notebook_id, paragraph_id, ctx=ctx, timeout=600.0,
+    )
+    job_status = job_body.get("status", "UNKNOWN")
 
-    resp_body = data.get("body", {})
-    code = resp_body.get("code", "UNKNOWN")
+    # Fetch full paragraph to get results
+    data = _check_status(await zeppelin.request(
+        "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    p = data.get("body", {})
+    results = p.get("results", {})
+    code = results.get("code", job_status)
+
     lines = [f"Status: {code}"]
-    lines.extend(_format_messages(resp_body.get("msg", []), include_html=include_html, limit_rows=max_rows))
+    if results.get("msg"):
+        lines.extend(_format_messages(results["msg"], include_html=include_html, limit_rows=max_rows))
     return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("running paragraph async")
+async def run_paragraph_async(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_id: str,
+    params: Optional[dict[str, Any]] = None,
+) -> str:
+    """Start paragraph execution and return immediately without waiting for results.
+    Use this to run multiple paragraphs in parallel, then check status with get_paragraph_status
+    and read results with get_paragraph.
+
+    Chart/visualization settings are preserved automatically.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to run
+        params: Optional dict of dynamic form values, e.g. {"city": "Seoul"}.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
+        json=_build_params_body(params),
+    ))
+    return f"Started paragraph {paragraph_id}. Use get_paragraph_status to check completion."
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -1055,7 +1099,7 @@ async def run_all_paragraphs(
     params: Optional[dict[str, Any]] = None,
 ) -> str:
     """Run all paragraphs in a notebook and wait for completion.
-    Chart settings are saved/restored automatically around execution.
+    Uses the async job endpoint which preserves chart/visualization settings.
 
     Args:
         notebook_id: The notebook ID to run
@@ -1063,13 +1107,7 @@ async def run_all_paragraphs(
     """
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
-    nb_data = await zeppelin.request("GET", f"/api/notebook/{notebook_id}")
-    saved_paragraphs: list[dict] = []
-    if nb_data.get("status") == "OK":
-        nb_path = nb_data.get("body", {}).get("name", "")
-        if "/~Backups/" in nb_path or nb_path.startswith("~Backups/"):
-            raise ToolError("Cannot modify notebooks in ~Backups — these are protected backup notebooks")
-        saved_paragraphs = nb_data.get("body", {}).get("paragraphs", [])
+    await _check_backup_protection(zeppelin, notebook_id)
 
     _check_status(await zeppelin.request(
         "POST", f"/api/notebook/job/{notebook_id}",
@@ -1078,18 +1116,8 @@ async def run_all_paragraphs(
 
     completed = await _wait_for_notebook_completion(zeppelin, notebook_id, ctx=ctx)
 
-    restored = 0
-    for p in saved_paragraphs:
-        pid = p.get("id")
-        if pid and p.get("config"):
-            await _restore_paragraph_config(zeppelin, notebook_id, pid, p)
-            restored += 1
-
     status = "completed" if completed else "timed out"
-    return (
-        f"Execution of all paragraphs in notebook {notebook_id} {status}. "
-        f"Restored chart settings for {restored} paragraphs."
-    )
+    return f"Execution of all paragraphs in notebook {notebook_id} {status}."
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
@@ -1251,6 +1279,29 @@ async def import_notebook(ctx: Context, notebook_json: str, new_name: str | None
         raise ToolError("Cannot import notebooks into ~Backups — these are protected backup notebooks")
     data = _check_status(await zeppelin.request("POST", "/api/notebook/import", json=body))
     return f"Imported notebook with id: {data.get('body', 'unknown')}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("cloning notebook")
+async def clone_notebook(ctx: Context, notebook_id: str, new_name: str | None = None) -> str:
+    """Clone an existing notebook. Optionally rename the copy.
+
+    Args:
+        notebook_id: The notebook ID to clone
+        new_name: Optional full path/name for the cloned notebook (e.g. "Users/john/Project/Copy").
+                  If omitted, Zeppelin auto-generates a name in the source's parent folder.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if new_name and ("/~Backups/" in new_name or new_name.startswith("~Backups/")):
+        raise ToolError("Cannot clone notebooks into ~Backups — these are protected backup notebooks")
+    zeppelin = _get_zeppelin(ctx)
+    if not new_name:
+        # Without an explicit new_name, Zeppelin auto-names the clone in the source's
+        # parent folder — which would land in ~Backups if the source is there.
+        await _check_backup_protection(zeppelin, notebook_id)
+    body = {"name": new_name} if new_name else None
+    data = _check_status(await zeppelin.request("POST", f"/api/notebook/{notebook_id}", json=body))
+    return f"Cloned notebook with id: {data.get('body', 'unknown')}"
 
 
 def main():

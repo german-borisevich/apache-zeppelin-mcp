@@ -26,7 +26,8 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `move_paragraph` | Move a paragraph to a new position within the same notebook |
 | `create_notebook` | Create a new empty notebook |
 | `add_paragraph` | Add a new paragraph to an existing notebook |
-| `run_paragraph` | Run a paragraph synchronously and return the result (preserves chart settings) |
+| `run_paragraph` | Run a paragraph and return the result (preserves chart settings) |
+| `run_paragraph_async` | Start paragraph execution without waiting — for parallel runs, check status with get_paragraph_status |
 | `run_all_paragraphs` | Run all paragraphs in a notebook and wait for completion (preserves chart settings) |
 | `get_paragraph_status` | Check execution status of a paragraph |
 | `stop_paragraph` | Stop a running paragraph (cancel long-running or stuck queries) |
@@ -34,6 +35,7 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `set_notebook_permissions` | Set owners, writers, and readers for a notebook |
 | `export_notebook` | Export notebook as JSON for backup or cross-server migration |
 | `import_notebook` | Import a previously exported notebook JSON |
+| `clone_notebook` | Clone an existing notebook with optional rename |
 
 Edit and delete operations automatically back up previous paragraph content to protected `~Backups` notebooks before making changes.
 
@@ -154,7 +156,7 @@ mcp dev server.py
 ```
 
 This opens a browser where you can:
-- See all 22 registered tools
+- See all 24 registered tools
 - Call `list_notebooks` to verify the connection to Zeppelin is working
 - Test `search_notebooks` with a keyword
 - Try `get_notebook` with a notebook ID from the list
@@ -165,7 +167,7 @@ This opens a browser where you can:
 After adding the server to `claude_desktop_config.json` and restarting Claude Desktop:
 
 1. Open a new conversation
-2. Click the hammer icon at the bottom of the input box — you should see all 22 Zeppelin tools listed
+2. Click the hammer icon at the bottom of the input box — you should see all 24 Zeppelin tools listed
 3. Ask Claude: *"List all my Zeppelin notebooks"*
 4. Claude will call `list_notebooks` and show the results
 
