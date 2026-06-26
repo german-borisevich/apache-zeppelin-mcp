@@ -1006,6 +1006,63 @@ async def add_paragraph(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("cloning paragraph")
+async def clone_paragraph(ctx: Context, notebook_id: str, paragraph_id: str) -> str:
+    """Clone a paragraph within the same notebook. The copy is created directly below the
+    source paragraph and carries over its code, title, and visualization/chart config.
+    The clone's title gets a " (copy)" suffix; untitled paragraphs stay untitled.
+
+    Zeppelin has no dedicated clone-paragraph endpoint, so this reads the source paragraph,
+    creates a new one with the same content, then copies its config in a single tool call.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to clone
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved is None:
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
+
+    # Find the source paragraph's position so the clone lands directly below it.
+    notebook = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
+    paragraphs = notebook.get("body", {}).get("paragraphs", [])
+    clone_index: Optional[int] = None
+    for i, p in enumerate(paragraphs):
+        if p.get("id") == paragraph_id:
+            clone_index = i + 1
+            break
+
+    body: dict[str, Any] = {"text": saved.get("text", "")}
+    source_title = saved.get("title")
+    if source_title:
+        body["title"] = f"{source_title} (copy)"
+    if clone_index is not None:
+        body["index"] = clone_index
+    data = _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/{notebook_id}/paragraph", json=body
+    ))
+    new_pid = data.get("body", "unknown")
+
+    config = saved.get("config")
+    if config and new_pid != "unknown":
+        try:
+            await zeppelin.request(
+                "PUT",
+                f"/api/notebook/{notebook_id}/paragraph/{new_pid}/config",
+                json=config,
+            )
+        except Exception:
+            logger.warning("Failed to copy config to cloned paragraph %s", new_pid, exc_info=True)
+
+    position = f"at index {clone_index}" if clone_index is not None else "at end of notebook"
+    return f"Cloned paragraph {paragraph_id} to new paragraph {new_pid} {position}."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
 @_tool_error_handler("running paragraph")
 async def run_paragraph(
     ctx: Context,
