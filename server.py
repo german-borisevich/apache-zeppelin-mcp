@@ -17,6 +17,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("zeppelin-mcp")
@@ -385,6 +386,209 @@ async def _backup_paragraph(
         )
     except Exception:
         logger.warning("Failed to set title visibility for backup paragraph %s", backup_para_id, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Batch operations — input models, helpers, and per-item logic
+#
+# The singular paragraph tools and their batch siblings share the same core
+# logic via the _apply_* / _run_and_collect helpers below, so behavior stays
+# identical. Batch tools call these in a sequential loop (see plan: sequential
+# avoids racing on the shared backup-notebook cache and preserves order).
+# ---------------------------------------------------------------------------
+
+class ParagraphUpdate(BaseModel):
+    """One paragraph edit for batch_update_paragraph."""
+    paragraph_id: str
+    text: str
+    title: Optional[str] = None
+
+
+class NewParagraph(BaseModel):
+    """One paragraph to create for batch_add_paragraph."""
+    text: str
+    title: Optional[str] = None
+    index: Optional[int] = None
+
+
+class ParagraphConfig(BaseModel):
+    """One paragraph config change for batch_update_paragraph_config."""
+    paragraph_id: str
+    config: dict[str, Any]
+
+
+# Paragraph run-result codes that count as a failure for stop_on_error.
+_RUN_FAILURE_CODES = {"ERROR", "ABORT", "TIMEOUT"}
+
+
+def _short_error(e: Exception, limit: int = 200) -> str:
+    """Compact, single-line reason string for per-item batch failures."""
+    msg = (str(e) or type(e).__name__).replace("\n", " ").strip()
+    return msg if len(msg) <= limit else msg[:limit] + "…"
+
+
+def _format_batch_result(verb: str, succeeded: int, total: int, failures: list[str]) -> str:
+    """Render '<verb> N/M paragraphs.' plus an optional failure list."""
+    line = f"{verb} {succeeded}/{total} paragraphs."
+    if failures:
+        line += "\nFailed:\n" + "\n".join(f"- {f}" for f in failures)
+    return line
+
+
+async def _apply_paragraph_update(
+    zeppelin: "ZeppelinClient", notebook_id: str, notebook_path: str,
+    paragraph_id: str, text: str, title: Optional[str] = None,
+) -> None:
+    """Core of update_paragraph: backup-on-change, then PUT text/title."""
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved is None:
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
+
+    old_text = saved.get("text", "")
+    if old_text != text:
+        await _backup_paragraph(zeppelin, notebook_id, notebook_path, paragraph_id, saved, "EDIT")
+
+    body: dict[str, Any] = {"text": text}
+    if title is not None:
+        body["title"] = title
+    await zeppelin.request(
+        "PUT", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}", json=body
+    )
+
+    if title is not None:
+        try:
+            await zeppelin.request(
+                "PUT",
+                f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+                json={"title": True},
+            )
+        except Exception:
+            logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
+
+
+async def _apply_paragraph_delete(
+    zeppelin: "ZeppelinClient", notebook_id: str, notebook_path: str, paragraph_id: str,
+) -> None:
+    """Core of delete_paragraph: backup then DELETE."""
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved is None:
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
+    await _backup_paragraph(zeppelin, notebook_id, notebook_path, paragraph_id, saved, "DELETE")
+    _check_status(await zeppelin.request(
+        "DELETE", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+
+
+async def _apply_paragraph_add(
+    zeppelin: "ZeppelinClient", notebook_id: str,
+    text: str, title: Optional[str] = None, index: Optional[int] = None,
+) -> str:
+    """Core of add_paragraph: POST a new paragraph, return its id."""
+    body: dict[str, Any] = {"text": text}
+    if title is not None:
+        body["title"] = title
+    if index is not None:
+        body["index"] = index
+    data = _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/{notebook_id}/paragraph", json=body
+    ))
+    paragraph_id = data.get("body", "unknown")
+
+    if title is not None and paragraph_id != "unknown":
+        try:
+            await zeppelin.request(
+                "PUT",
+                f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+                json={"title": True},
+            )
+        except Exception:
+            logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
+    return paragraph_id
+
+
+async def _apply_paragraph_config(
+    zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str, config: dict[str, Any],
+) -> dict[str, Any]:
+    """Core of update_paragraph_config: deep-merge config (auto-filling column
+    index/aggr from output headers) and PUT it. Returns the merged config."""
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved:
+        current_config = saved.get("config", {})
+        if "graph" in config:
+            user_graph = config["graph"]
+
+            col_index_map = {}
+            results_msg = saved.get("results", {}).get("msg", [])
+            if results_msg:
+                first_msg = results_msg[0].get("data", "")
+                header_line = first_msg.split("\n", 1)[0]
+                if header_line:
+                    col_index_map = {name: i for i, name in enumerate(header_line.split("\t"))}
+
+            if col_index_map:
+                for field in ("keys", "groups", "values"):
+                    for col in user_graph.get(field, []):
+                        if "index" not in col or col["index"] is None:
+                            name = col.get("name", "")
+                            if name in col_index_map:
+                                col["index"] = col_index_map[name]
+                        if "aggr" not in col:
+                            col["aggr"] = "sum"
+
+            merged_graph = {**current_config.get("graph", {}), **user_graph}
+            config = {**current_config, **config, "graph": merged_graph}
+            results = config.get("results", {})
+            if results:
+                for result_data in results.values():
+                    if isinstance(result_data, dict) and "graph" in result_data:
+                        merged_result_graph = {**result_data["graph"], **user_graph}
+                        # Ensure mode is consistent with top-level
+                        if "mode" not in user_graph and "mode" in merged_graph:
+                            merged_result_graph["mode"] = merged_graph["mode"]
+                        result_data["graph"] = merged_result_graph
+            else:
+                # No results entries — create one with the merged graph config
+                config["results"] = {"0": {"graph": {**merged_graph}}}
+        else:
+            config = {**current_config, **config}
+
+    await zeppelin.request(
+        "PUT",
+        f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
+        json=config,
+    )
+    return config
+
+
+async def _run_and_collect(
+    zeppelin: "ZeppelinClient", notebook_id: str, paragraph_id: str,
+    params: Optional[dict[str, Any]], max_rows: int, include_html: bool,
+    ctx: Context | None = None,
+) -> tuple[str, list[str]]:
+    """Core of run_paragraph: start the job, wait, fetch results.
+    Returns (status_code, formatted_output_lines)."""
+    _check_status(await zeppelin.request(
+        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
+        json=_build_params_body(params),
+    ))
+
+    job_body = await _wait_for_paragraph_completion(
+        zeppelin, notebook_id, paragraph_id, ctx=ctx, timeout=600.0,
+    )
+    job_status = job_body.get("status", "UNKNOWN")
+
+    # Fetch full paragraph to get results
+    data = _check_status(await zeppelin.request(
+        "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
+    ))
+    p = data.get("body", {})
+    results = p.get("results", {})
+    code = results.get("code", job_status)
+
+    out_lines: list[str] = []
+    if results.get("msg"):
+        out_lines.extend(_format_messages(results["msg"], include_html=include_html, limit_rows=max_rows))
+    return code, out_lines
 
 
 # ---------------------------------------------------------------------------
@@ -782,52 +986,7 @@ async def update_paragraph_config(
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
     await _check_backup_protection(zeppelin, notebook_id)
-    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-    if saved:
-        current_config = saved.get("config", {})
-        if "graph" in config:
-            user_graph = config["graph"]
-
-            col_index_map = {}
-            results_msg = saved.get("results", {}).get("msg", [])
-            if results_msg:
-                first_msg = results_msg[0].get("data", "")
-                header_line = first_msg.split("\n", 1)[0]
-                if header_line:
-                    col_index_map = {name: i for i, name in enumerate(header_line.split("\t"))}
-
-            if col_index_map:
-                for field in ("keys", "groups", "values"):
-                    for col in user_graph.get(field, []):
-                        if "index" not in col or col["index"] is None:
-                            name = col.get("name", "")
-                            if name in col_index_map:
-                                col["index"] = col_index_map[name]
-                        if "aggr" not in col:
-                            col["aggr"] = "sum"
-
-            merged_graph = {**current_config.get("graph", {}), **user_graph}
-            config = {**current_config, **config, "graph": merged_graph}
-            results = config.get("results", {})
-            if results:
-                for result_data in results.values():
-                    if isinstance(result_data, dict) and "graph" in result_data:
-                        merged_result_graph = {**result_data["graph"], **user_graph}
-                        # Ensure mode is consistent with top-level
-                        if "mode" not in user_graph and "mode" in merged_graph:
-                            merged_result_graph["mode"] = merged_graph["mode"]
-                        result_data["graph"] = merged_result_graph
-            else:
-                # No results entries — create one with the merged graph config
-                config["results"] = {"0": {"graph": {**merged_graph}}}
-        else:
-            config = {**current_config, **config}
-
-    await zeppelin.request(
-        "PUT",
-        f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-        json=config,
-    )
+    config = await _apply_paragraph_config(zeppelin, notebook_id, paragraph_id, config)
     graph = config.get("graph", {})
     mode = graph.get("mode")
     parts = [f"Updated config for paragraph {paragraph_id}"]
@@ -840,6 +999,43 @@ async def update_paragraph_config(
     if graph.get("values"):
         parts.append(f"values: {[v['name'] for v in graph['values']]}")
     return ". ".join(parts) + "."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("updating paragraphs config")
+async def batch_update_paragraph_config(
+    ctx: Context,
+    notebook_id: str,
+    configs: list[ParagraphConfig],
+) -> str:
+    """Update visualization/chart config for multiple paragraphs in one call (batch version of
+    update_paragraph_config). Each config is deep-merged with that paragraph's existing config.
+
+    Prefer this over many update_paragraph_config calls — it collapses N round-trips into one.
+    Paragraphs are processed sequentially; one failing item does not stop the rest (failures are
+    reported in the result).
+
+    Args:
+        notebook_id: The notebook ID containing the paragraphs
+        configs: List of config changes, each {paragraph_id, config}. See update_paragraph_config
+            for the config dict format (graph.mode, keys/groups/values, etc.).
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if not configs:
+        raise ToolError("configs must not be empty")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+
+    failures: list[str] = []
+    succeeded = 0
+    for c in configs:
+        try:
+            _validate_id(c.paragraph_id, "paragraph_id")
+            await _apply_paragraph_config(zeppelin, notebook_id, c.paragraph_id, c.config)
+            succeeded += 1
+        except Exception as e:
+            failures.append(f"{c.paragraph_id}: {_short_error(e)}")
+    return _format_batch_result("Updated config for", succeeded, len(configs), failures)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
@@ -863,32 +1059,46 @@ async def update_paragraph(
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
     notebook_path = await _check_backup_protection(zeppelin, notebook_id)
-    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-    if saved is None:
-        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
-
-    old_text = saved.get("text", "")
-    if old_text != text:
-        await _backup_paragraph(zeppelin, notebook_id, notebook_path, paragraph_id, saved, "EDIT")
-
-    body: dict[str, Any] = {"text": text}
-    if title is not None:
-        body["title"] = title
-    await zeppelin.request(
-        "PUT", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}", json=body
-    )
-
-    if title is not None:
-        try:
-            await zeppelin.request(
-                "PUT",
-                f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-                json={"title": True},
-            )
-        except Exception:
-            logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
-
+    await _apply_paragraph_update(zeppelin, notebook_id, notebook_path, paragraph_id, text, title)
     return f"Updated paragraph {paragraph_id}."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))
+@_tool_error_handler("updating paragraphs")
+async def batch_update_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    updates: list[ParagraphUpdate],
+) -> str:
+    """Update multiple paragraphs in one call (batch version of update_paragraph). Previous
+    content of each changed paragraph is automatically backed up.
+
+    Prefer this over many update_paragraph calls when editing several paragraphs — it collapses
+    N round-trips into one. Paragraphs are updated sequentially; one failing item does not stop
+    the rest (failures are reported in the result).
+
+    Args:
+        notebook_id: The notebook ID containing the paragraphs
+        updates: List of edits, each {paragraph_id, text, title?}.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if not updates:
+        raise ToolError("updates must not be empty")
+    zeppelin = _get_zeppelin(ctx)
+    notebook_path = await _check_backup_protection(zeppelin, notebook_id)
+
+    failures: list[str] = []
+    succeeded = 0
+    for u in updates:
+        try:
+            _validate_id(u.paragraph_id, "paragraph_id")
+            await _apply_paragraph_update(
+                zeppelin, notebook_id, notebook_path, u.paragraph_id, u.text, u.title
+            )
+            succeeded += 1
+        except Exception as e:
+            failures.append(f"{u.paragraph_id}: {_short_error(e)}")
+    return _format_batch_result("Updated", succeeded, len(updates), failures)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
@@ -908,16 +1118,47 @@ async def delete_paragraph(
     _validate_id(paragraph_id, "paragraph_id")
     zeppelin = _get_zeppelin(ctx)
     notebook_path = await _check_backup_protection(zeppelin, notebook_id)
-    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
-    if saved is None:
-        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
-
-    await _backup_paragraph(zeppelin, notebook_id, notebook_path, paragraph_id, saved, "DELETE")
-
-    _check_status(await zeppelin.request(
-        "DELETE", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
-    ))
+    await _apply_paragraph_delete(zeppelin, notebook_id, notebook_path, paragraph_id)
     return f"Deleted paragraph {paragraph_id}. Previous content backed up."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
+@_tool_error_handler("deleting paragraphs")
+async def batch_delete_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_ids: list[str],
+) -> str:
+    """Delete multiple paragraphs in one call (batch version of delete_paragraph). Each
+    paragraph's content is automatically backed up before deletion.
+
+    Prefer this over many delete_paragraph calls — it collapses N round-trips into one.
+    Paragraphs are deleted sequentially; one failing item does not stop the rest (failures are
+    reported in the result).
+
+    Args:
+        notebook_id: The notebook ID containing the paragraphs
+        paragraph_ids: List of paragraph IDs to delete.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if not paragraph_ids:
+        raise ToolError("paragraph_ids must not be empty")
+    zeppelin = _get_zeppelin(ctx)
+    notebook_path = await _check_backup_protection(zeppelin, notebook_id)
+
+    failures: list[str] = []
+    succeeded = 0
+    for pid in paragraph_ids:
+        try:
+            _validate_id(pid, "paragraph_id")
+            await _apply_paragraph_delete(zeppelin, notebook_id, notebook_path, pid)
+            succeeded += 1
+        except Exception as e:
+            failures.append(f"{pid}: {_short_error(e)}")
+    line = f"Deleted {succeeded}/{len(paragraph_ids)} paragraphs. Previous content backed up."
+    if failures:
+        line += "\nFailed:\n" + "\n".join(f"- {f}" for f in failures)
+    return line
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
@@ -982,27 +1223,48 @@ async def add_paragraph(
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
     await _check_backup_protection(zeppelin, notebook_id)
-    body: dict[str, Any] = {"text": text}
-    if title is not None:
-        body["title"] = title
-    if index is not None:
-        body["index"] = index
-    data = _check_status(await zeppelin.request(
-        "POST", f"/api/notebook/{notebook_id}/paragraph", json=body
-    ))
-    paragraph_id = data.get("body", "unknown")
-
-    if title is not None and paragraph_id != "unknown":
-        try:
-            await zeppelin.request(
-                "PUT",
-                f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}/config",
-                json={"title": True},
-            )
-        except Exception:
-            logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
-
+    paragraph_id = await _apply_paragraph_add(zeppelin, notebook_id, text, title, index)
     return f"Added paragraph with id: {paragraph_id}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("adding paragraphs")
+async def batch_add_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraphs: list[NewParagraph],
+) -> str:
+    """Add multiple paragraphs to a notebook in one call (batch version of add_paragraph).
+    Paragraphs are created sequentially in the given order.
+
+    Prefer this over many add_paragraph calls when scaffolding several cells — it collapses N
+    round-trips into one. One failing item does not stop the rest (failures are reported).
+
+    Args:
+        notebook_id: The notebook ID to add paragraphs to
+        paragraphs: List of paragraphs to create, each {text, title?, index?}.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if not paragraphs:
+        raise ToolError("paragraphs must not be empty")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+
+    new_ids: list[str] = []
+    failures: list[str] = []
+    for i, para in enumerate(paragraphs):
+        try:
+            pid = await _apply_paragraph_add(zeppelin, notebook_id, para.text, para.title, para.index)
+            new_ids.append(pid)
+        except Exception as e:
+            failures.append(f"#{i}: {_short_error(e)}")
+    line = f"Added {len(new_ids)}/{len(paragraphs)} paragraphs"
+    if new_ids:
+        line += ": " + ", ".join(new_ids)
+    line += "."
+    if failures:
+        line += "\nFailed:\n" + "\n".join(f"- {f}" for f in failures)
+    return line
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
@@ -1093,28 +1355,70 @@ async def run_paragraph(
     zeppelin = _get_zeppelin(ctx)
     await _check_backup_protection(zeppelin, notebook_id)
 
-    _check_status(await zeppelin.request(
-        "POST", f"/api/notebook/job/{notebook_id}/{paragraph_id}",
-        json=_build_params_body(params),
-    ))
-
-    job_body = await _wait_for_paragraph_completion(
-        zeppelin, notebook_id, paragraph_id, ctx=ctx, timeout=600.0,
+    code, out_lines = await _run_and_collect(
+        zeppelin, notebook_id, paragraph_id, params, max_rows, include_html, ctx
     )
-    job_status = job_body.get("status", "UNKNOWN")
-
-    # Fetch full paragraph to get results
-    data = _check_status(await zeppelin.request(
-        "GET", f"/api/notebook/{notebook_id}/paragraph/{paragraph_id}"
-    ))
-    p = data.get("body", {})
-    results = p.get("results", {})
-    code = results.get("code", job_status)
-
-    lines = [f"Status: {code}"]
-    if results.get("msg"):
-        lines.extend(_format_messages(results["msg"], include_html=include_html, limit_rows=max_rows))
+    lines = [f"Status: {code}"] + out_lines
     return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+@_tool_error_handler("running paragraphs")
+async def batch_run_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_ids: list[str],
+    params: Optional[dict[str, Any]] = None,
+    max_rows: int = 50,
+    include_html: bool = False,
+    stop_on_error: bool = True,
+) -> str:
+    """Run several paragraphs one after another in the given order, in a single call.
+    Use this instead of many run_paragraph calls when you need a specific sequence of cells run —
+    e.g. setup cells before the cells that depend on them. Paragraphs run sequentially (not in
+    parallel) because cells typically share interpreter state, and this collapses N round-trips
+    into one.
+
+    By default table output is limited to 50 rows and HTML output is omitted to save tokens.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraphs
+        paragraph_ids: Paragraph IDs to run, in execution order.
+        params: Optional dict of dynamic form values applied to each paragraph, e.g. {"city": "Seoul"}.
+        max_rows: Maximum data rows per table output (default 50, 0 = unlimited). Header row always included.
+        include_html: If True, include HTML output converted to plain text. Default False.
+        stop_on_error: If True (default), stop at the first paragraph that errors and report the
+            remaining ones as skipped. If False, run every paragraph regardless of failures.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if not paragraph_ids:
+        raise ToolError("paragraph_ids must not be empty")
+    zeppelin = _get_zeppelin(ctx)
+    await _check_backup_protection(zeppelin, notebook_id)
+
+    blocks: list[str] = []
+    ran = 0
+    stopped = False
+    for i, pid in enumerate(paragraph_ids):
+        try:
+            _validate_id(pid, "paragraph_id")
+            code, out_lines = await _run_and_collect(
+                zeppelin, notebook_id, pid, params, max_rows, include_html, ctx
+            )
+        except Exception as e:
+            code, out_lines = "ERROR", [f"Error: {_short_error(e)}"]
+        ran += 1
+        blocks.append("\n".join([f"=== {pid} — Status: {code} ==="] + out_lines))
+        if stop_on_error and code in _RUN_FAILURE_CODES:
+            stopped = True
+            skipped = paragraph_ids[i + 1:]
+            if skipped:
+                blocks.append(
+                    f"Stopped after error (stop_on_error=True). Skipped: {', '.join(skipped)}"
+                )
+            break
+    header = f"Ran {ran}/{len(paragraph_ids)} paragraphs" + (" (stopped on error)." if stopped else ".")
+    return _truncate(header + "\n\n" + "\n\n".join(blocks))
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
