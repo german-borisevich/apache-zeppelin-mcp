@@ -21,13 +21,18 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `get_paragraph_forms` | Get dynamic form definitions and current parameter values for a paragraph |
 | `update_paragraph_forms` | Update dynamic form values without re-executing (preserves chart settings) |
 | `update_paragraph_config` | Update paragraph visualization/chart config (graph type, column mappings, display settings) |
+| `batch_update_paragraph_config` | **Batch:** update visualization/chart config for several paragraphs in one call |
 | `update_paragraph` | Update paragraph code/text with automatic backup of previous version |
+| `batch_update_paragraph` | **Batch:** update several paragraphs in one call (each changed paragraph is backed up) |
 | `delete_paragraph` | Delete a paragraph with automatic backup of its content |
+| `batch_delete_paragraph` | **Batch:** delete several paragraphs in one call (each is backed up first) |
 | `move_paragraph` | Move a paragraph to a new position within the same notebook |
 | `create_notebook` | Create a new empty notebook |
 | `add_paragraph` | Add a new paragraph to an existing notebook |
+| `batch_add_paragraph` | **Batch:** add several paragraphs in one call, created in the given order |
 | `clone_paragraph` | Clone a paragraph (code, title, and chart config) directly below the original |
 | `run_paragraph` | Run a paragraph and return the result (preserves chart settings) |
+| `batch_run_paragraph` | **Batch:** run several paragraphs sequentially in a given order (stops on first error by default) |
 | `run_paragraph_async` | Start paragraph execution without waiting — for parallel runs, check status with get_paragraph_status |
 | `run_all_paragraphs` | Run all paragraphs in a notebook and wait for completion (preserves chart settings) |
 | `get_paragraph_status` | Check execution status of a paragraph |
@@ -157,7 +162,7 @@ mcp dev server.py
 ```
 
 This opens a browser where you can:
-- See all 25 registered tools
+- See all 30 registered tools
 - Call `list_notebooks` to verify the connection to Zeppelin is working
 - Test `search_notebooks` with a keyword
 - Try `get_notebook` with a notebook ID from the list
@@ -168,7 +173,7 @@ This opens a browser where you can:
 After adding the server to `claude_desktop_config.json` and restarting Claude Desktop:
 
 1. Open a new conversation
-2. Click the hammer icon at the bottom of the input box — you should see all 25 Zeppelin tools listed
+2. Click the hammer icon at the bottom of the input box — you should see all 30 Zeppelin tools listed
 3. Ask Claude: *"List all my Zeppelin notebooks"*
 4. Claude will call `list_notebooks` and show the results
 
@@ -202,10 +207,10 @@ If all steps succeed, the server is fully operational.
 
 ## Automatic Backup
 
-When `update_paragraph` or `delete_paragraph` modifies existing content, the previous version is automatically saved to a backup notebook before the change is applied.
+When `update_paragraph`/`batch_update_paragraph` or `delete_paragraph`/`batch_delete_paragraph` modifies existing content, the previous version is automatically saved to a backup notebook before the change is applied.
 
 - **Backup location:** `Users/<username>/~Backups/<original_notebook_path>/<notebook_name>_<notebook_id>_backup` (mirrors the original path)
-- **What triggers a backup:** `update_paragraph` (only when text actually changes), `delete_paragraph` (always)
+- **What triggers a backup:** `update_paragraph`/`batch_update_paragraph` (per paragraph, only when text actually changes), `delete_paragraph`/`batch_delete_paragraph` (always, per paragraph)
 - **What doesn't trigger a backup:** `move_paragraph`, title-only changes, `add_paragraph`
 - **Protection:** All mutating tools (add, run, update, delete, move, set permissions) are blocked from operating on `~Backups` notebooks. Read-only tools work normally on backup notebooks.
 - **Backup paragraph titles** include a UTC timestamp and operation label, e.g. `[2025-01-15 14:30 UTC | EDIT] paragraph_20250115-143012_123456`
