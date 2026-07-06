@@ -1,0 +1,12 @@
+{
+  "name": "apache-zeppelin-mcp",
+  "description": "Marketplace for the Apache Zeppelin MCP plugin",
+  "owner": { "name": "German Borysevich" },
+  "plugins": [
+    {
+      "name": "apache-zeppelin",
+      "source": "./",
+      "description": "Apache Zeppelin notebook MCP server + notebook workflow skills"
+    }
+  ]
+}

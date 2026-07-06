@@ -1,0 +1,11 @@
+{
+  "name": "apache-zeppelin",
+  "author": { "name": "German Borysevich" },
+  "description": "Apache Zeppelin notebook MCP server + notebook workflow skills (/notebook, /review_notebook). Requires ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME and ZEPPELIN_PASSWORD in your environment.",
+  "mcpServers": {
+    "zeppelin": {
+      "command": "uv",
+      "args": ["--directory", "${CLAUDE_PLUGIN_ROOT}", "run", "server.py"]
+    }
+  }
+}
