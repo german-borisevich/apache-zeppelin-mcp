@@ -45,6 +45,39 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 
 Edit and delete operations automatically back up previous paragraph content to protected `~Backups` notebooks before making changes.
 
+## Skills
+
+The repo also ships two Claude Code skills that encode notebook-workflow best practices (installed automatically with the plugin setup below):
+
+- **`/notebook`** — create notebooks, add/edit paragraphs, configure charts and dynamic forms; finalizes every paragraph with the code editor hidden and auto-re-run disabled.
+- **`/review_notebook`** — structured notebook review: methodology, conclusions, code quality, visualization, documentation.
+
+## Ways to use this project
+
+1. **Claude Code plugin (recommended)** — one command installs the MCP server *and* the skills, and auto-updates on every commit. See below.
+2. **Plain MCP server** — register the server manually in Claude Desktop / Claude Code / any MCP client; skills are not included. See the setup sections further down.
+3. **Building block for a private setup** — teams can keep their own wrapper plugin (pinned URL, internal skills) in a private marketplace and launch this server from git without cloning:
+   `uvx --from git+https://github.com/german-borisevich/apache-zeppelin-mcp@<tag> apache-zeppelin-mcp`
+
+## Setup as a Claude Code plugin (recommended)
+
+1. Export credentials in your shell profile (the server inherits them from the environment):
+
+```bash
+export ZEPPELIN_BASE_URL="http://your-zeppelin-host:8080"
+export ZEPPELIN_USERNAME="your-username"
+export ZEPPELIN_PASSWORD="your-password"
+```
+
+2. In Claude Code:
+
+```
+/plugin marketplace add german-borisevich/apache-zeppelin-mcp
+/plugin install apache-zeppelin@apache-zeppelin-mcp
+```
+
+3. Restart the session. The Zeppelin MCP tools and the `/notebook`, `/review_notebook` skills are now available, and the plugin auto-updates at session start whenever this repo gets new commits.
+
 ## Setup for Claude Desktop
 
 1. Open Claude Desktop settings and navigate to the MCP servers configuration file:

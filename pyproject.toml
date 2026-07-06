@@ -8,3 +8,13 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.26.0",
 ]
+
+[project.scripts]
+apache-zeppelin-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]
