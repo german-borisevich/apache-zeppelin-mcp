@@ -10,6 +10,43 @@ $ARGUMENTS
 
 Follow the steps below in order.
 
+## Step 0: Check the artifact doc cache
+
+Before discovering anything, check whether this artifact is already documented.
+Full protocol: `$WIKI_DOCS_PATH/docs/artifact_cache_protocol.md`.
+
+### Cache state (resolved at invocation)
+
+- Docs root: !`echo "${WIKI_DOCS_PATH:-unset}"`
+- Sync: !`[ -d "$WIKI_DOCS_PATH/.git" ] && { git -C "$WIKI_DOCS_PATH" pull --ff-only --quiet 2>/dev/null && echo synced || echo "pull failed - using local copy"; } || echo "no clone - cache off, use normal discovery"`
+- Project slug (derived from cwd): !`head -1 knowledge/project/data_model.md 2>/dev/null | sed 's/^# //; s/ Data Model$//'`
+- Project `_index.md`:
+
+```
+!`s=$(head -1 knowledge/project/data_model.md 2>/dev/null | sed 's/^# //; s/ Data Model$//'); [ -n "$s" ] && cat "$WIKI_DOCS_PATH/$s/_index.md" 2>/dev/null || echo "(no index for slug '$s' - cold cache, or slug underivable from this cwd; resolve per protocol 1)"`
+```
+
+1. Interpret the pre-resolved cache state above — it already performed the env
+   resolution, the `git pull --ff-only` sync, the `<project_slug>` derivation,
+   and the `_index.md` read; do NOT redo them. Docs root `unset` or "no clone"
+   → log one warning and proceed with normal discovery (the cache is optional;
+   never create the root directory yourself — only the SessionStart hook's
+   clone does). Slug empty or index unreadable → resolve them manually per
+   protocol §1 (the cwd may not be the analyst repo).
+2. **Not listed (cold miss)** → proceed to normal discovery; write the spec in
+   the final step.
+3. **Listed** → call `get_notebook_fingerprint(notebook_id,
+   spec_path="$WIKI_DOCS_PATH/<project_slug>/notebooks/<id>.md")` — the server
+   reads the stored hashes from the spec frontmatter itself and returns `match`
+   plus an exact `diff`; never hand-compare hash maps or re-type them into tool
+   arguments. Then read the spec body (it is the payload, not part of the check):
+   - **`match: true` (hit)** → trust the spec, **skip Step 2 discovery**, go to the task.
+   - **`match: false` (stale)** → `diff` names the changed/added/removed
+     paragraph ids; re-learn those **and their dependents** (cross-unit rule,
+     protocol §5); update the spec in the final step.
+   - **`spec_note` in the response** → stored hashes unreadable; treat the spec
+     as unverified background and run normal discovery.
+
 ## Step 1: Identify the notebook
 
 - If the user provides a notebook ID → use `get_notebook` directly
@@ -137,6 +174,25 @@ For paragraphs with charts, fold these keys into the same `update_paragraph_conf
 When finalizing **several** paragraphs, use `batch_update_paragraph_config` — one call with a config object per paragraph (same shape as above) instead of N `update_paragraph_config` calls.
 
 **Verify before writing:** `editorHide` and `runOnSelectionChange` are paragraph-config keys in current Zeppelin versions, but names can shift across versions. Fetch the current config via `get_paragraph` and confirm the key is accepted; if `update_paragraph_config` returns without the key taking effect, check the paragraph's JSON and adapt (e.g. some versions nest the editor-hide flag under `editorSetting`).
+
+## Step 4: Update the artifact doc cache
+
+After the task succeeds, persist what was learned (protocol: `$WIKI_DOCS_PATH/docs/artifact_cache_protocol.md`):
+
+- **Cold miss** → write a new spec to
+  `$WIKI_DOCS_PATH/<project_slug>/notebooks/<notebook_id>.md` using the spec
+  template (fingerprint + units via `get_notebook_fingerprint`; record
+  `validated:`), and register it:
+  `wiki index-add <project> notebooks/<id>.md --name "…" --desc "…"`.
+- **Stale** → update the changed `## Per-unit notes` / `## Architecture` sections
+  (plus dependents per the cross-unit rule), append a `## Change log` entry (cap
+  at 5 — drop the oldest), refresh `validated:`, and re-fetch the fingerprint
+  into the frontmatter.
+- **Do not run git commands** — the plugin Stop hook commits and pushes.
+  If the hook reports a rebase conflict in `_index.md`, take the remote version
+  and re-add this artifact's bullet — never hand-merge prose. (Hook not
+  installed — older plugin — → commit manually per protocol §6.)
+- If `$WIKI_DOCS_PATH` is unset/absent, skip silently — do not fail the task.
 
 ## Boundaries
 
