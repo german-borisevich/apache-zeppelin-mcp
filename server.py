@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import hashlib
 import html
 import json
 import os
@@ -58,7 +59,13 @@ def _tool_error_handler(operation: str):
                 raise ToolError(f"Error {operation}: HTTP {e.response.status_code}") from e
             except Exception as e:
                 logger.error("Error %s: %s", operation, e, exc_info=True)
-                raise ToolError(f"Error {operation}: {type(e).__name__}") from e
+                detail = str(e).replace("\n", " ").strip()
+                if len(detail) > 300:
+                    detail = detail[:300] + "…"
+                msg = f"Error {operation}: {type(e).__name__}"
+                if detail:
+                    msg += f": {detail}"
+                raise ToolError(msg) from e
         return wrapper
     return decorator
 
@@ -307,21 +314,45 @@ async def _get_notebook_path(zeppelin: "ZeppelinClient", notebook_id: str) -> st
     return data.get("body", {}).get("name", "")
 
 
-_notebook_path_cache: dict[str, str] = {}
+# Both caches store (value, cached_at_monotonic). Entries expire after
+# _CACHE_TTL_SECONDS so a notebook renamed/moved outside this server (e.g. via
+# the Zeppelin UI) can't satisfy the ~Backups guard with a stale path forever,
+# and the caches are wiped at _CACHE_MAX_ENTRIES so they can't grow unbounded.
+# Correctness of the backup guard matters more than cache hit rate.
+_CACHE_TTL_SECONDS = 300.0
+_CACHE_MAX_ENTRIES = 512
+
+_notebook_path_cache: dict[str, tuple[str, float]] = {}
+
+
+def _cache_get(cache: dict[str, tuple[str, float]], key: str) -> Optional[str]:
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    value, cached_at = entry
+    if time.monotonic() - cached_at >= _CACHE_TTL_SECONDS:
+        del cache[key]
+        return None
+    return value
+
+
+def _cache_put(cache: dict[str, tuple[str, float]], key: str, value: str) -> None:
+    if len(cache) >= _CACHE_MAX_ENTRIES:
+        cache.clear()
+    cache[key] = (value, time.monotonic())
 
 
 async def _check_backup_protection(zeppelin: "ZeppelinClient", notebook_id: str) -> str:
-    if notebook_id in _notebook_path_cache:
-        path = _notebook_path_cache[notebook_id]
-    else:
+    path = _cache_get(_notebook_path_cache, notebook_id)
+    if path is None:
         path = await _get_notebook_path(zeppelin, notebook_id)
-        _notebook_path_cache[notebook_id] = path
+        _cache_put(_notebook_path_cache, notebook_id, path)
     if "/~Backups/" in path or path.startswith("~Backups/"):
         raise ToolError("Cannot modify notebooks in ~Backups — these are protected backup notebooks")
     return path
 
 
-_backup_notebook_id_cache: dict[str, str] = {}
+_backup_notebook_id_cache: dict[str, tuple[str, float]] = {}
 
 
 async def _backup_paragraph(
@@ -338,7 +369,7 @@ async def _backup_paragraph(
         backup_path = f"Users/{ZEPPELIN_USERNAME}/~Backups/{backup_name}"
 
     # Find or create backup notebook (with cache)
-    backup_notebook_id = _backup_notebook_id_cache.get(backup_path)
+    backup_notebook_id = _cache_get(_backup_notebook_id_cache, backup_path)
 
     if not backup_notebook_id:
         data = _check_status(await zeppelin.request("GET", "/api/notebook"))
@@ -357,7 +388,7 @@ async def _backup_paragraph(
         if not backup_notebook_id:
             raise ToolError("Failed to create backup notebook")
 
-    _backup_notebook_id_cache[backup_path] = backup_notebook_id
+    _cache_put(_backup_notebook_id_cache, backup_path, backup_notebook_id)
 
     # Build backup paragraph
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -592,8 +623,129 @@ async def _run_and_collect(
 
 
 # ---------------------------------------------------------------------------
+# Notebook fingerprinting
+#
+# Deterministic content hash over the *stable* parts of a notebook, computed
+# server-side so agents can check freshness of cached notebook docs with one
+# cheap call instead of re-reading the whole notebook.
+#
+# Only id, title, and code text are hashed. Everything else is excluded as
+# volatile: execution status, results/output, run timestamps, form values,
+# form *definitions* (re-registered on every run, options may derive from
+# query results), and chart configs (Zeppelin sync quirks mutate them without
+# a real edit). Paragraph ORDER is also excluded — a reorder alone does not
+# flag the notebook stale.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_hash(obj: Any) -> str:
+    """sha256 over the canonical JSON serialization of `obj`."""
+    encoded = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _paragraph_fingerprint_unit(paragraph: dict) -> dict[str, Any]:
+    """Whitelist the stable fields of one paragraph: id, title, code text."""
+    return {
+        "id": paragraph.get("id"),
+        "title": paragraph.get("title") or "",
+        "text": (paragraph.get("text") or "").strip(),
+    }
+
+
+def _notebook_fingerprint(notebook_id: str, paragraphs: list[dict]) -> dict[str, Any]:
+    """Per-paragraph sub-hashes plus an order-insensitive overall fingerprint."""
+    units: dict[str, str] = {}
+    for i, p in enumerate(paragraphs):
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id") or f"paragraph-{i}"
+        units[pid] = _canonical_hash(_paragraph_fingerprint_unit(p))
+    parts = [notebook_id] + sorted(f"{pid}:{h}" for pid, h in units.items())
+    overall = "sha256:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return {"fingerprint": overall, "units": units}
+
+
+def _fingerprint_diff(current: dict[str, str], known: dict[str, str]) -> dict[str, Any]:
+    """Exact unit-level diff between the live fingerprint map and a stored one."""
+    return {
+        "changed": sorted(k for k in current if k in known and current[k] != known[k]),
+        "added": sorted(k for k in current if k not in known),
+        "removed": sorted(k for k in known if k not in current),
+    }
+
+
+def _parse_spec_frontmatter(text: str) -> dict[str, Any]:
+    """Extract stored fingerprint / units / updated_at from a cached-doc spec.
+
+    Tolerant regex parser: the frontmatter block is machine-written in a fixed
+    shape (artifact doc cache protocol §3), so a YAML dependency isn't needed.
+    Returns {} when nothing usable is found — never raises.
+    """
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    fm = text[3:end]
+    out: dict[str, Any] = {}
+    for field in ("fingerprint", "updated_at"):
+        # Capture to end of line minus trailing comment — values may contain
+        # spaces (e.g. "updated_at: 2026-06-19 12:34:56").
+        m = re.search(rf"^{field}:[ \t]*([^#\n]+)", fm, re.MULTILINE)
+        if m:
+            value = m.group(1).strip()
+            if value:
+                out[field] = value
+    um = re.search(r"^units:[^\n]*\n((?:[ \t]+[^\n]*\n?)*)", fm, re.MULTILINE)
+    if um:
+        units: dict[str, str] = {}
+        for line in um.group(1).splitlines():
+            lm = re.match(r"^[ \t]+([^\s:#]+):\s*([^\s#]+)", line)
+            if lm:
+                units[lm.group(1)] = lm.group(2)
+        if units:
+            out["units"] = units
+    return out
+
+
+def _load_spec_frontmatter(spec_path: str) -> tuple[dict[str, Any], Optional[str]]:
+    """Read stored hashes from a spec file inside $WIKI_DOCS_PATH.
+
+    Returns (frontmatter, note): on any problem the frontmatter is {} and the
+    note says why — the caller degrades to "stored hashes unknown" instead of
+    failing the freshness check. The only hard error is a path escaping the
+    docs root (that is a caller bug, not an environment condition).
+    """
+    docs_root = os.environ.get("WIKI_DOCS_PATH", "").strip()
+    if not docs_root:
+        return {}, "WIKI_DOCS_PATH is not set — spec_path ignored"
+    root = os.path.realpath(os.path.expanduser(docs_root))
+    path = os.path.realpath(os.path.expanduser(spec_path))
+    if not path.startswith(root + os.sep):
+        raise ToolError("spec_path must point inside $WIKI_DOCS_PATH")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {}, "spec file unreadable — treating stored hashes as unknown"
+    fm = _parse_spec_frontmatter(text)
+    if not (fm.get("fingerprint") or fm.get("units")):
+        return {}, "no stored hashes in spec frontmatter — treating as unknown"
+    return fm, None
+
+
+# ---------------------------------------------------------------------------
 # Zeppelin client
 # ---------------------------------------------------------------------------
+
+# Retry policy for transient failures: Zeppelin returns 503 and drops
+# connections when overloaded/restarting. Module-level so tests can patch the
+# backoff to zero.
+REQUEST_RETRY_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
+_RETRYABLE_EXCEPTIONS = (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError)
+
 
 class ZeppelinClient:
     def __init__(self, base_url: str, username: str, password: str):
@@ -625,12 +777,41 @@ class ZeppelinClient:
         kw: dict[str, Any] = {"json": json, "params": params}
         if timeout is not None:
             kw["timeout"] = httpx.Timeout(timeout)
-        resp = await self.client.request(method, url, **kw)
+
+        for attempt in range(REQUEST_RETRY_ATTEMPTS):
+            last_attempt = attempt == REQUEST_RETRY_ATTEMPTS - 1
+            backoff = REQUEST_RETRY_BACKOFF_SECONDS[
+                min(attempt, len(REQUEST_RETRY_BACKOFF_SECONDS) - 1)
+            ]
+            try:
+                resp = await self.client.request(method, url, **kw)
+            except _RETRYABLE_EXCEPTIONS as e:
+                if last_attempt:
+                    raise
+                logger.warning(
+                    "Transient %s on %s %s — retrying in %.0fs",
+                    type(e).__name__, method, path, backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            if resp.status_code == 503 and not last_attempt:
+                logger.warning(
+                    "Zeppelin returned 503 for %s %s (overloaded or restarting) — retrying in %.0fs",
+                    method, path, backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            break
 
         if resp.status_code in (401, 403) or resp.is_redirect:
             logger.info("Session expired (HTTP %s), re-authenticating", resp.status_code)
             await self.login()
             resp = await self.client.request(method, url, **kw)
+            if resp.is_redirect:
+                raise ZeppelinAPIError(
+                    "Zeppelin keeps redirecting to the login page — authentication failed "
+                    "or the server is restarting; wait and retry"
+                )
 
         resp.raise_for_status()
         return resp.json()
@@ -970,6 +1151,8 @@ async def update_paragraph_config(
     """Update paragraph visualization/chart config (graph type, columns, display settings).
     Fetches current config and deep-merges provided changes.
     Column index and aggr fields are auto-filled from the paragraph's output headers — only provide name.
+    Auto-fill needs saved output: run the paragraph at least once first, otherwise index/aggr
+    cannot be auto-filled and columns are passed through as given.
 
     Args:
         notebook_id: The notebook ID containing the paragraph
@@ -1010,6 +1193,8 @@ async def batch_update_paragraph_config(
 ) -> str:
     """Update visualization/chart config for multiple paragraphs in one call (batch version of
     update_paragraph_config). Each config is deep-merged with that paragraph's existing config.
+    Column index/aggr auto-fill needs saved output: run each paragraph at least once first,
+    otherwise index/aggr cannot be auto-filled and columns are passed through as given.
 
     Prefer this over many update_paragraph_config calls — it collapses N round-trips into one.
     Paragraphs are processed sequentially; one failing item does not stop the rest (failures are
@@ -1605,6 +1790,57 @@ async def set_notebook_permissions(
         f"  Runners: {', '.join(runners) if runners else '(none)'}",
     ]
     return "\n".join(lines)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@_tool_error_handler("fingerprinting notebook")
+async def get_notebook_fingerprint(
+    ctx: Context,
+    notebook_id: str,
+    spec_path: Optional[str] = None,
+    known_fingerprint: Optional[str] = None,
+    known_units: Optional[dict[str, str]] = None,
+) -> str:
+    """Get a deterministic content fingerprint of a notebook, plus per-paragraph sub-hashes.
+
+    Cheap freshness check for cached notebook documentation. Only stable content is
+    hashed (paragraph id, title, code text); execution status, output, form
+    values/definitions, chart configs, and paragraph order are all excluded — none of
+    those flag the notebook stale.
+
+    The comparison against the cached doc happens server-side — never hand-compare
+    hash maps. Preferred: pass `spec_path` (the spec file under $WIKI_DOCS_PATH) and
+    the server reads the stored fingerprint/units from its frontmatter itself; the
+    response gains `"match": true|false` and `"diff": {changed, added, removed}`
+    naming the exact paragraph ids that differ. If the spec can't be used, the
+    response carries a `spec_note` explaining why and no match/diff. Fallback when
+    there is no docs repo: pass the stored values explicitly as `known_fingerprint` /
+    `known_units` (they take precedence over `spec_path` if both are given).
+
+    Args:
+        notebook_id: The notebook ID to fingerprint
+        spec_path: Optional path to the cached spec file inside $WIKI_DOCS_PATH
+        known_fingerprint: Optional stored overall fingerprint to compare against
+        known_units: Optional stored per-paragraph sub-hash map to diff against
+    """
+    _validate_id(notebook_id, "notebook_id")
+    zeppelin = _get_zeppelin(ctx)
+    data = _check_status(await zeppelin.request("GET", f"/api/notebook/{notebook_id}"))
+    nb = data.get("body", {})
+    result = _notebook_fingerprint(nb.get("id", notebook_id), nb.get("paragraphs", []))
+    if spec_path:
+        stored, note = _load_spec_frontmatter(spec_path)
+        if note:
+            result["spec_note"] = note
+        if known_fingerprint is None:
+            known_fingerprint = stored.get("fingerprint")
+        if not known_units:
+            known_units = stored.get("units")
+    if known_fingerprint is not None:
+        result["match"] = result["fingerprint"] == known_fingerprint
+    if known_units:
+        result["diff"] = _fingerprint_diff(result["units"], known_units)
+    return json.dumps(result)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
