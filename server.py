@@ -168,7 +168,7 @@ def _format_forms(paragraph: dict) -> list[str]:
 
 
 def _format_config(paragraph: dict) -> list[str]:
-    """Format paragraph visualization config for display."""
+    """Format paragraph visualization and presentation config for display."""
     config = paragraph.get("config", {})
 
     # Result-level graph is what the UI actually renders — check it first
@@ -184,32 +184,57 @@ def _format_config(paragraph: dict) -> list[str]:
     top_graph = config.get("graph", {})
     graph = result_graph or top_graph
 
-    if not graph:
-        return []
+    lines = []
+    if graph:
+        lines.append("Visualization:")
+        mode = graph.get("mode", "table")
+        lines.append(f"  chart type: {mode}")
+        if graph.get("keys"):
+            lines.append(f"  keys: {[k['name'] for k in graph['keys']]}")
+        if graph.get("groups"):
+            lines.append(f"  groups: {[g['name'] for g in graph['groups']]}")
+        if graph.get("values"):
+            lines.append(f"  values: {[v['name'] for v in graph['values']]}")
+        col_width = config.get("colWidth")
+        if col_width and col_width != 12:
+            lines.append(f"  colWidth: {col_width}")
 
-    lines = ["Visualization:"]
-    mode = graph.get("mode", "table")
-    lines.append(f"  chart type: {mode}")
-    if graph.get("keys"):
-        lines.append(f"  keys: {[k['name'] for k in graph['keys']]}")
-    if graph.get("groups"):
-        lines.append(f"  groups: {[g['name'] for g in graph['groups']]}")
-    if graph.get("values"):
-        lines.append(f"  values: {[v['name'] for v in graph['values']]}")
-    col_width = config.get("colWidth")
-    if col_width and col_width != 12:
-        lines.append(f"  colWidth: {col_width}")
+        # Warn if top-level and result-level configs are out of sync
+        if result_graph and top_graph:
+            def _col_names(g, field):
+                return sorted(c.get("name", "") for c in g.get(field, []))
+            for field in ("keys", "groups", "values"):
+                if _col_names(result_graph, field) != _col_names(top_graph, field):
+                    lines.append(f"  ⚠ WARNING: chart settings out of sync between config.graph and config.results — UI uses result-level config")
+                    break
 
-    # Warn if top-level and result-level configs are out of sync
-    if result_graph and top_graph:
-        def _col_names(g, field):
-            return sorted(c.get("name", "") for c in g.get(field, []))
-        for field in ("keys", "groups", "values"):
-            if _col_names(result_graph, field) != _col_names(top_graph, field):
-                lines.append(f"  ⚠ WARNING: chart settings out of sync between config.graph and config.results — UI uses result-level config")
-                break
-
+    # Presentation flags — always emitted so their absence is visible too
+    editor_hide = config.get("editorHide")
+    run_on_change = config.get("runOnSelectionChange")
+    lines.append("Presentation:")
+    lines.append(
+        f"  editorHide: {'not set' if editor_hide is None else str(editor_hide).lower()}"
+        + ("" if editor_hide else " (code editor visible to readers)")
+    )
+    lines.append(
+        f"  runOnSelectionChange: {'not set' if run_on_change is None else str(run_on_change).lower()}"
+        + ("" if run_on_change is False else " (form changes auto-run the paragraph)")
+    )
     return lines
+
+
+def _presentation_markers(paragraph: dict) -> str:
+    """Compact deviation markers for list_paragraphs — non-empty only when a
+    presentation flag deviates from the finalized-paragraph standard
+    (editorHide: true; runOnSelectionChange: false on paragraphs with forms)."""
+    config = paragraph.get("config", {})
+    markers = []
+    if not config.get("editorHide"):
+        markers.append("editor visible")
+    forms = (paragraph.get("settings") or {}).get("forms") or {}
+    if forms and config.get("runOnSelectionChange") is not False:
+        markers.append("runs on selection change")
+    return f" [{', '.join(markers)}]" if markers else ""
 
 
 def _build_params_body(params: Optional[dict[str, Any]]) -> dict[str, Any] | None:
@@ -941,7 +966,8 @@ async def get_notebook(ctx: Context, notebook_id: str, include_config: bool = Fa
 
     Args:
         notebook_id: The notebook ID to retrieve
-        include_config: If True, include visualization/chart config for each paragraph. Default False.
+        include_config: If True, include visualization/chart config and presentation
+            flags (editorHide, runOnSelectionChange) for each paragraph. Default False.
     """
     _validate_id(notebook_id, "notebook_id")
     zeppelin = _get_zeppelin(ctx)
@@ -977,6 +1003,11 @@ async def get_notebook(ctx: Context, notebook_id: str, include_config: bool = Fa
 async def list_paragraphs(ctx: Context, notebook_id: str) -> str:
     """List paragraph metadata (index, id, title, status) without code or output.
 
+    Paragraphs whose presentation config deviates from the finalized standard are
+    marked inline: [editor visible] when editorHide is not true, and
+    [runs on selection change] when the paragraph has forms but
+    runOnSelectionChange is not false. Unmarked paragraphs are properly finalized.
+
     Args:
         notebook_id: The notebook ID to list paragraphs for
     """
@@ -1000,7 +1031,8 @@ async def list_paragraphs(ctx: Context, notebook_id: str) -> str:
             if len(first_line) > 60:
                 first_line = first_line[:60] + "..."
             label = f'"{first_line}"' if first_line else "(empty)"
-        lines.append(f"[{i}] {pid} - {label} (status: {status})")
+        markers = _presentation_markers(p)
+        lines.append(f"[{i}] {pid} - {label} (status: {status}){markers}")
     return "\n".join(lines)
 
 
@@ -1010,7 +1042,8 @@ async def get_paragraph(
     ctx: Context, notebook_id: str, paragraph_id: str,
     max_rows: int = 50, include_html: bool = False,
 ) -> str:
-    """Get full content of a single paragraph (code, output, and dynamic forms).
+    """Get full content of a single paragraph (code, output, dynamic forms,
+    chart config, and presentation flags like editorHide / runOnSelectionChange).
 
     By default, table output is limited to 50 rows and HTML output is omitted to save tokens.
     When investigating data discrepancies, set max_rows=0 for unlimited rows.
