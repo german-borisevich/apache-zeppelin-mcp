@@ -1,6 +1,6 @@
 [project]
 name = "apache-zeppelin-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for Apache Zeppelin notebook interaction via the REST API"
 readme = "README.md"
 requires-python = ">=3.10"
