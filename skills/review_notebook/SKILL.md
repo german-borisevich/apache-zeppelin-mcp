@@ -71,7 +71,7 @@ Review against the team's pitfalls/style documentation if the workspace has any;
 - Correct sorting for time-based axes
 - Readable column names (no `a.date` artifacts from JOINs)
 - Reasonable number of series/categories (not 50 lines on one chart)
-- **Paragraph presentation flags**: flag any finalized paragraph whose code editor is still visible (config missing `editorHide: true`) or whose forms have "Run on selection change" enabled (`runOnSelectionChange` not set to `false`). These are set via `update_paragraph_config` and should be standard on every non-draft paragraph — readers shouldn't see raw code, and dropdown changes shouldn't auto-trigger heavy queries. Inspect the config with `get_paragraph`.
+- **Paragraph presentation flags**: flag any finalized paragraph whose code editor is still visible (config missing `editorHide: true`) or whose forms have "Run on selection change" enabled (`runOnSelectionChange` not set to `false`). These are set via `update_paragraph_config` and should be standard on every non-draft paragraph — readers shouldn't see raw code, and dropdown changes shouldn't auto-trigger heavy queries. Audit the whole notebook with a single `list_paragraphs` call: deviating paragraphs are marked inline with `[editor visible]` and/or `[runs on selection change]`; unmarked paragraphs are fine. Per-paragraph detail (a `Presentation:` section with both flags) appears in `get_paragraph` output. Do NOT use `export_notebook` for this — its output embeds all paragraph results and routinely exceeds the output limit.
 
 ## Step 8: Check documentation
 
