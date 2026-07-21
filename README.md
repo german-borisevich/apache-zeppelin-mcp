@@ -32,7 +32,7 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `batch_add_paragraph` | **Batch:** add several paragraphs in one call, created in the given order |
 | `clone_paragraph` | Clone a paragraph (code, title, and chart config) directly below the original |
 | `run_paragraph` | Run a paragraph and return the result (preserves chart settings) |
-| `batch_run_paragraph` | **Batch:** run several paragraphs sequentially in a given order (stops on first error by default) |
+| `batch_run_paragraph` | **Batch:** run several paragraphs sequentially in a given order, each optionally with its own dynamic-form params (stops on first error by default) |
 | `run_paragraph_async` | Start paragraph execution without waiting — for parallel runs, check status with get_paragraph_status |
 | `run_all_paragraphs` | Run all paragraphs in a notebook and wait for completion (preserves chart settings) |
 | `get_paragraph_status` | Check execution status of a paragraph |
