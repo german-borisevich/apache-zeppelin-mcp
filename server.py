@@ -473,6 +473,12 @@ class ParagraphConfig(BaseModel):
     config: dict[str, Any]
 
 
+class ParagraphRun(BaseModel):
+    """One paragraph to run for batch_run_paragraph."""
+    paragraph_id: str
+    params: Optional[dict[str, Any]] = None
+
+
 # Paragraph run-result codes that count as a failure for stop_on_error.
 _RUN_FAILURE_CODES = {"ERROR", "ABORT", "TIMEOUT"}
 
@@ -1585,7 +1591,7 @@ async def run_paragraph(
 async def batch_run_paragraph(
     ctx: Context,
     notebook_id: str,
-    paragraph_ids: list[str],
+    runs: list[ParagraphRun],
     params: Optional[dict[str, Any]] = None,
     max_rows: int = 50,
     include_html: bool = False,
@@ -1597,45 +1603,55 @@ async def batch_run_paragraph(
     parallel) because cells typically share interpreter state, and this collapses N round-trips
     into one.
 
+    Each run item may carry its own dynamic form params. The top-level params dict is a shared
+    default merged under per-item params (the item wins on key conflicts). The same paragraph_id
+    may appear multiple times with different params — a parameter sweep in one call.
+
     By default table output is limited to 50 rows and HTML output is omitted to save tokens.
 
     Args:
         notebook_id: The notebook ID containing the paragraphs
-        paragraph_ids: Paragraph IDs to run, in execution order.
-        params: Optional dict of dynamic form values applied to each paragraph, e.g. {"city": "Seoul"}.
+        runs: Paragraphs to run in execution order, each {paragraph_id, params?}. Example:
+            [{"paragraph_id": "p1"}, {"paragraph_id": "p2", "params": {"city": "Seoul"}}]
+        params: Optional shared dynamic form values applied to every item, e.g. {"env": "prod"}.
+            Per-item params override these per key.
         max_rows: Maximum data rows per table output (default 50, 0 = unlimited). Header row always included.
         include_html: If True, include HTML output converted to plain text. Default False.
         stop_on_error: If True (default), stop at the first paragraph that errors and report the
             remaining ones as skipped. If False, run every paragraph regardless of failures.
     """
     _validate_id(notebook_id, "notebook_id")
-    if not paragraph_ids:
-        raise ToolError("paragraph_ids must not be empty")
+    if not runs:
+        raise ToolError("runs must not be empty")
     zeppelin = _get_zeppelin(ctx)
     await _check_backup_protection(zeppelin, notebook_id)
 
     blocks: list[str] = []
     ran = 0
     stopped = False
-    for i, pid in enumerate(paragraph_ids):
+    for i, item in enumerate(runs):
         try:
-            _validate_id(pid, "paragraph_id")
+            _validate_id(item.paragraph_id, "paragraph_id")
+            effective = (
+                {**(params or {}), **(item.params or {})}
+                if (params or item.params) else None
+            )
             code, out_lines = await _run_and_collect(
-                zeppelin, notebook_id, pid, params, max_rows, include_html, ctx
+                zeppelin, notebook_id, item.paragraph_id, effective, max_rows, include_html, ctx
             )
         except Exception as e:
             code, out_lines = "ERROR", [f"Error: {_short_error(e)}"]
         ran += 1
-        blocks.append("\n".join([f"=== {pid} — Status: {code} ==="] + out_lines))
+        blocks.append("\n".join([f"=== {item.paragraph_id} — Status: {code} ==="] + out_lines))
         if stop_on_error and code in _RUN_FAILURE_CODES:
             stopped = True
-            skipped = paragraph_ids[i + 1:]
+            skipped = [r.paragraph_id for r in runs[i + 1:]]
             if skipped:
                 blocks.append(
                     f"Stopped after error (stop_on_error=True). Skipped: {', '.join(skipped)}"
                 )
             break
-    header = f"Ran {ran}/{len(paragraph_ids)} paragraphs" + (" (stopped on error)." if stopped else ".")
+    header = f"Ran {ran}/{len(runs)} paragraphs" + (" (stopped on error)." if stopped else ".")
     return _truncate(header + "\n\n" + "\n\n".join(blocks))
 
 

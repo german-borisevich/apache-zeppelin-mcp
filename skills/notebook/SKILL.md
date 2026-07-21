@@ -148,7 +148,7 @@ Set `graph.keys`, `graph.groups`, `graph.values` with `name` only — omit `inde
 
 ### Running paragraphs
 
-- Several paragraphs in order → `batch_run_paragraph` (runs sequentially in the given order; stops on first error by default) — use this for the "run each paragraph one-by-one" step of notebook migrations instead of N separate calls
+- Several paragraphs in order → `batch_run_paragraph` (runs sequentially in the given order; stops on first error by default; each run item is `{paragraph_id, params?}` so cells can get different form values, with top-level `params` as the shared default) — use this for the "run each paragraph one-by-one" step of notebook migrations instead of N separate calls
 - Long-running query → `run_paragraph_async` to start without waiting, then poll `get_paragraph_status`
 - Stuck or runaway execution → `stop_paragraph`
 - Exploratory queries → always add a `LIMIT` so a scratch query can't scan or return unbounded data

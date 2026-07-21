@@ -17,7 +17,7 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 import server
-from server import ParagraphUpdate, ZeppelinAPIError
+from server import ParagraphRun, ParagraphUpdate, ZeppelinAPIError
 
 
 def run(coro):
@@ -147,6 +147,7 @@ class FakeZeppelin:
         self.run_codes = run_codes or {}  # pid -> results code ("SUCCESS"/"ERROR")
         self.path_fetches = 0
         self.calls: list[tuple[str, str]] = []
+        self.run_param_bodies: list[tuple[str, dict | None]] = []  # (pid, POST json body)
 
     async def request(self, method, path, json=None, params=None, timeout=None):
         self.calls.append((method, path))
@@ -173,6 +174,7 @@ class FakeZeppelin:
         if m:
             pid = m.group(1)
             if method == "POST":
+                self.run_param_bodies.append((pid, json))
                 return {"status": "OK", "body": {}}
             if method == "GET":
                 status = "FINISHED" if self.run_codes.get(pid, "SUCCESS") == "SUCCESS" else "ERROR"
@@ -245,7 +247,10 @@ def test_batch_run_paragraph_stops_on_error():
         },
         run_codes={"bad": "ERROR"},
     )
-    result = run(server.batch_run_paragraph(_ctx(fake), "NB1", ["ok1", "bad", "ok2"]))
+    result = run(server.batch_run_paragraph(
+        _ctx(fake), "NB1",
+        [ParagraphRun(paragraph_id="ok1"), ParagraphRun(paragraph_id="bad"), ParagraphRun(paragraph_id="ok2")],
+    ))
 
     assert "Ran 2/3 paragraphs (stopped on error)." in result
     assert "Skipped: ok2" in result
@@ -262,13 +267,38 @@ def test_batch_run_paragraph_continues_when_stop_on_error_false():
         },
         run_codes={"bad": "ERROR"},
     )
-    result = run(
-        server.batch_run_paragraph(_ctx(fake), "NB1", ["ok1", "bad", "ok2"], stop_on_error=False)
-    )
+    result = run(server.batch_run_paragraph(
+        _ctx(fake), "NB1",
+        [ParagraphRun(paragraph_id="ok1"), ParagraphRun(paragraph_id="bad"), ParagraphRun(paragraph_id="ok2")],
+        stop_on_error=False,
+    ))
 
     assert "Ran 3/3 paragraphs." in result
     assert "Skipped" not in result
     assert ("POST", "/api/notebook/job/NB1/ok2") in fake.calls
+
+
+def test_batch_run_paragraph_merges_shared_and_per_item_params():
+    fake = FakeZeppelin(paragraphs={"p1": _para("p1"), "p2": _para("p2")})
+    runs = [
+        ParagraphRun(paragraph_id="p1"),                                            # shared only
+        ParagraphRun(paragraph_id="p2", params={"city": "Seoul", "env": "stage"}),  # overrides shared key
+        ParagraphRun(paragraph_id="p2", params={"city": "Tokyo"}),                  # sweep: same pid again
+    ]
+    result = run(server.batch_run_paragraph(_ctx(fake), "NB1", runs, params={"env": "prod"}))
+
+    assert "Ran 3/3 paragraphs." in result
+    assert fake.run_param_bodies == [
+        ("p1", {"params": {"env": "prod"}}),
+        ("p2", {"params": {"env": "stage", "city": "Seoul"}}),
+        ("p2", {"params": {"env": "prod", "city": "Tokyo"}}),
+    ]
+
+
+def test_batch_run_paragraph_without_any_params_posts_none():
+    fake = FakeZeppelin(paragraphs={"p1": _para("p1")})
+    run(server.batch_run_paragraph(_ctx(fake), "NB1", [ParagraphRun(paragraph_id="p1")]))
+    assert fake.run_param_bodies == [("p1", None)]
 
 
 # ---------------------------------------------------------------------------
