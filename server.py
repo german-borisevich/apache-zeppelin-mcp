@@ -1343,6 +1343,9 @@ async def update_paragraph(
 ) -> str:
     """Update paragraph code/text. Previous content is automatically backed up before changes.
 
+    Sends the whole new text — for small targeted changes prefer edit_paragraph, which sends
+    only the changed snippet.
+
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to update
@@ -1370,6 +1373,8 @@ async def batch_update_paragraph(
     Prefer this over many update_paragraph calls when editing several paragraphs — it collapses
     N round-trips into one. Paragraphs are updated sequentially; one failing item does not stop
     the rest (failures are reported in the result).
+
+    For small targeted changes prefer batch_edit_paragraph, which sends only changed snippets.
 
     Args:
         notebook_id: The notebook ID containing the paragraphs
