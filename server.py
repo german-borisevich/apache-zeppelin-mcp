@@ -460,6 +460,14 @@ class ParagraphUpdate(BaseModel):
     title: Optional[str] = None
 
 
+class ParagraphEdit(BaseModel):
+    """One find-and-replace edit for batch_edit_paragraph."""
+    paragraph_id: str
+    old_string: str
+    new_string: str
+    replace_all: bool = False
+
+
 class NewParagraph(BaseModel):
     """One paragraph to create for batch_add_paragraph."""
     text: str
@@ -500,9 +508,14 @@ def _format_batch_result(verb: str, succeeded: int, total: int, failures: list[s
 async def _apply_paragraph_update(
     zeppelin: "ZeppelinClient", notebook_id: str, notebook_path: str,
     paragraph_id: str, text: str, title: Optional[str] = None,
+    saved: Optional[dict] = None,
 ) -> None:
-    """Core of update_paragraph: backup-on-change, then PUT text/title."""
-    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    """Core of update_paragraph: backup-on-change, then PUT text/title.
+
+    Pass `saved` (the paragraph as already fetched) to skip the re-fetch.
+    """
+    if saved is None:
+        saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
     if saved is None:
         raise ToolError(f"Could not fetch paragraph {paragraph_id}")
 
@@ -526,6 +539,63 @@ async def _apply_paragraph_update(
             )
         except Exception:
             logger.warning("Failed to set title visibility for %s", paragraph_id, exc_info=True)
+
+
+def _apply_text_edits(text: str, edits: list[ParagraphEdit]) -> tuple[str, int, int]:
+    """Apply find-and-replace edits in order, each against the previous edit's output.
+
+    Returns (new_text, total_replacements, line of the first edit's first match).
+    Raises ToolError on an empty, no-op, missing, or ambiguous old_string.
+    """
+    total = 0
+    first_line = 0
+    for i, e in enumerate(edits, 1):
+        where = f"edit {i}: " if len(edits) > 1 else ""
+        old, new = e.old_string, e.new_string
+        if not old:
+            raise ToolError(f"{where}old_string must not be empty (use update_paragraph to replace the whole text)")
+        if old == new:
+            raise ToolError(f"{where}old_string and new_string are identical")
+        count = text.count(old)
+        if count == 0:
+            msg = (f"{where}old_string not found — it must match exactly, incl. whitespace; "
+                   "copy it from get_paragraph_code")
+            lines = old.split("\n")
+            if all(l.startswith("  ") for l in lines if l):
+                dedented = "\n".join(l[2:] for l in lines)
+                if dedented in text:
+                    msg += ". It looks copied from get_notebook/get_paragraph, which indent code by 2 spaces"
+            raise ToolError(msg)
+        if count > 1 and not e.replace_all:
+            raise ToolError(
+                f"{where}old_string matches {count} times — add surrounding context to make it unique, "
+                "or set replace_all=true"
+            )
+        if i == 1:
+            first_line = text[:text.find(old)].count("\n") + 1
+        if e.replace_all:
+            text = text.replace(old, new)
+            total += count
+        else:
+            text = text.replace(old, new, 1)
+            total += 1
+    return text, total, first_line
+
+
+async def _apply_paragraph_edits(
+    zeppelin: "ZeppelinClient", notebook_id: str, notebook_path: str,
+    paragraph_id: str, edits: list[ParagraphEdit],
+) -> tuple[int, int]:
+    """Core of edit_paragraph: fetch, apply edits in memory (all-or-nothing), then
+    reuse _apply_paragraph_update for backup + PUT. Returns (replacements, first_line)."""
+    saved = await _save_paragraph_state(zeppelin, notebook_id, paragraph_id)
+    if saved is None:
+        raise ToolError(f"Could not fetch paragraph {paragraph_id}")
+    new_text, count, first_line = _apply_text_edits(saved.get("text") or "", edits)
+    await _apply_paragraph_update(
+        zeppelin, notebook_id, notebook_path, paragraph_id, new_text, saved=saved
+    )
+    return count, first_line
 
 
 async def _apply_paragraph_delete(
@@ -1273,6 +1343,9 @@ async def update_paragraph(
 ) -> str:
     """Update paragraph code/text. Previous content is automatically backed up before changes.
 
+    Sends the whole new text — for small targeted changes prefer edit_paragraph, which sends
+    only the changed snippet.
+
     Args:
         notebook_id: The notebook ID containing the paragraph
         paragraph_id: The paragraph ID to update
@@ -1301,6 +1374,8 @@ async def batch_update_paragraph(
     N round-trips into one. Paragraphs are updated sequentially; one failing item does not stop
     the rest (failures are reported in the result).
 
+    For small targeted changes prefer batch_edit_paragraph, which sends only changed snippets.
+
     Args:
         notebook_id: The notebook ID containing the paragraphs
         updates: List of edits, each {paragraph_id, text, title?}.
@@ -1323,6 +1398,90 @@ async def batch_update_paragraph(
         except Exception as e:
             failures.append(f"{u.paragraph_id}: {_short_error(e)}")
     return _format_batch_result("Updated", succeeded, len(updates), failures)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
+@_tool_error_handler("editing paragraph")
+async def edit_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    paragraph_id: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> str:
+    """Replace an exact snippet of paragraph code (find-and-replace). Previous content is
+    automatically backed up before changes.
+
+    Prefer this over update_paragraph for targeted changes — you send only the changed snippet
+    instead of the whole paragraph. Use update_paragraph for whole rewrites.
+
+    old_string must match the current code exactly, including whitespace and indentation: copy it
+    from get_paragraph_code (raw text), not from get_notebook/get_paragraph (they indent code by
+    2 spaces). Keep it minimal but unique — include a neighbouring line if the snippet repeats.
+
+    Args:
+        notebook_id: The notebook ID containing the paragraph
+        paragraph_id: The paragraph ID to edit
+        old_string: Exact existing text to replace (must occur once unless replace_all)
+        new_string: Replacement text
+        replace_all: Replace every occurrence instead of requiring a unique match (e.g. renames)
+    """
+    _validate_id(notebook_id, "notebook_id")
+    _validate_id(paragraph_id, "paragraph_id")
+    zeppelin = _get_zeppelin(ctx)
+    notebook_path = await _check_backup_protection(zeppelin, notebook_id)
+    edit = ParagraphEdit(
+        paragraph_id=paragraph_id, old_string=old_string,
+        new_string=new_string, replace_all=replace_all,
+    )
+    count, first_line = await _apply_paragraph_edits(
+        zeppelin, notebook_id, notebook_path, paragraph_id, [edit]
+    )
+    noun = "replacement" if count == 1 else "replacements"
+    return f"Edited paragraph {paragraph_id} ({count} {noun}, first at line {first_line})."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
+@_tool_error_handler("editing paragraphs")
+async def batch_edit_paragraph(
+    ctx: Context,
+    notebook_id: str,
+    edits: list[ParagraphEdit],
+) -> str:
+    """Apply several find-and-replace edits in one call (batch version of edit_paragraph),
+    across one or more paragraphs. Previous content of each changed paragraph is backed up.
+
+    Edits are grouped by paragraph and applied in the given order, each against the result of
+    the previous one. Per paragraph it is all-or-nothing: if any of its edits fails, that
+    paragraph is left untouched. Other paragraphs still proceed (failures are reported).
+
+    Args:
+        notebook_id: The notebook ID containing the paragraphs
+        edits: List of edits, each {paragraph_id, old_string, new_string, replace_all?}.
+    """
+    _validate_id(notebook_id, "notebook_id")
+    if not edits:
+        raise ToolError("edits must not be empty")
+    zeppelin = _get_zeppelin(ctx)
+    notebook_path = await _check_backup_protection(zeppelin, notebook_id)
+
+    by_paragraph: dict[str, list[ParagraphEdit]] = {}
+    for e in edits:
+        by_paragraph.setdefault(e.paragraph_id, []).append(e)
+
+    failures: list[str] = []
+    succeeded = 0
+    for paragraph_id, paragraph_edits in by_paragraph.items():
+        try:
+            _validate_id(paragraph_id, "paragraph_id")
+            await _apply_paragraph_edits(
+                zeppelin, notebook_id, notebook_path, paragraph_id, paragraph_edits
+            )
+            succeeded += 1
+        except Exception as e:
+            failures.append(f"{paragraph_id}: {_short_error(e)}")
+    return _format_batch_result("Edited", succeeded, len(by_paragraph), failures)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))

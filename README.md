@@ -24,6 +24,8 @@ An MCP (Model Context Protocol) server that wraps the Apache Zeppelin REST API, 
 | `batch_update_paragraph_config` | **Batch:** update visualization/chart config for several paragraphs in one call |
 | `update_paragraph` | Update paragraph code/text with automatic backup of previous version |
 | `batch_update_paragraph` | **Batch:** update several paragraphs in one call (each changed paragraph is backed up) |
+| `edit_paragraph` | Find-and-replace inside a paragraph's code — send only the changed snippet instead of the whole text (with automatic backup) |
+| `batch_edit_paragraph` | **Batch:** several find-and-replace edits across one or more paragraphs in one call (all-or-nothing per paragraph, each changed paragraph is backed up once) |
 | `delete_paragraph` | Delete a paragraph with automatic backup of its content |
 | `batch_delete_paragraph` | **Batch:** delete several paragraphs in one call (each is backed up first) |
 | `move_paragraph` | Move a paragraph to a new position within the same notebook |
@@ -240,10 +242,10 @@ If all steps succeed, the server is fully operational.
 
 ## Automatic Backup
 
-When `update_paragraph`/`batch_update_paragraph` or `delete_paragraph`/`batch_delete_paragraph` modifies existing content, the previous version is automatically saved to a backup notebook before the change is applied.
+When `update_paragraph`/`batch_update_paragraph`, `edit_paragraph`/`batch_edit_paragraph`, or `delete_paragraph`/`batch_delete_paragraph` modifies existing content, the previous version is automatically saved to a backup notebook before the change is applied.
 
 - **Backup location:** `Users/<username>/~Backups/<original_notebook_path>/<notebook_name>_<notebook_id>_backup` (mirrors the original path)
-- **What triggers a backup:** `update_paragraph`/`batch_update_paragraph` (per paragraph, only when text actually changes), `delete_paragraph`/`batch_delete_paragraph` (always, per paragraph)
+- **What triggers a backup:** `update_paragraph`/`batch_update_paragraph` and `edit_paragraph`/`batch_edit_paragraph` (per paragraph, only when text actually changes), `delete_paragraph`/`batch_delete_paragraph` (always, per paragraph)
 - **What doesn't trigger a backup:** `move_paragraph`, title-only changes, `add_paragraph`
 - **Protection:** All mutating tools (add, run, update, delete, move, set permissions) are blocked from operating on `~Backups` notebooks. Read-only tools work normally on backup notebooks.
 - **Backup paragraph titles** include a UTC timestamp and operation label, e.g. `[2025-01-15 14:30 UTC | EDIT] paragraph_20250115-143012_123456`

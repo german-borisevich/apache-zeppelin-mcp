@@ -108,7 +108,7 @@ df = pd.read_sql(sql, create_engine(os.getenv('YOUR_CONNECTION_STRING_ENV')).con
 
 Set a descriptive `title` for each paragraph. For a single paragraph use `add_paragraph`; for **two or more**, use `batch_add_paragraph` — one call, paragraphs created in the given order, returns the new IDs.
 
-**Fixing existing code:** use `update_paragraph` to edit one paragraph in place, or `batch_update_paragraph` for several (best-effort: per-item failures are reported, not fatal). The MCP server automatically backs up the original content before applying changes.
+**Fixing existing code:** for targeted changes (a line, a filter, a column, a rename) use `edit_paragraph` — find-and-replace that sends only the changed snippet instead of re-sending the whole paragraph, which is much faster and cheaper for long paragraphs. Read the code first with `get_paragraph_code` and copy `old_string` from that output (raw text — `get_notebook`/`get_paragraph` indent code by 2 spaces, so snippets copied from them won't match). `old_string` must match exactly and be unique: include a neighbouring line if it repeats, or set `replace_all` for renames. For several edits — in one paragraph or across many — use `batch_edit_paragraph` (one call; all-or-nothing per paragraph, other paragraphs still proceed). Use `update_paragraph` / `batch_update_paragraph` only for whole rewrites or when most of the paragraph changes. The MCP server automatically backs up the original content before applying any of these changes.
 
 **Same query, different chart:** use `clone_paragraph` — it copies code, title, and chart config directly below the original, so you only change the chart config afterwards instead of re-sending the code.
 
@@ -196,7 +196,7 @@ After the task succeeds, persist what was learned (protocol: `$WIKI_DOCS_PATH/do
 
 ## Boundaries
 
-**What MCP can do:** read/search notebooks and paragraphs; add/update/delete/move paragraphs (single or `batch_*` variants); clone paragraphs and notebooks; create/export/import notebooks; modify paragraph config (charts, single or batch); run paragraphs (sync, batch, or async with status polling) and stop them; update form values; read/update permissions.
+**What MCP can do:** read/search notebooks and paragraphs; add/update/delete/move paragraphs (single or `batch_*` variants); edit paragraph code in place via find-and-replace (`edit_paragraph`, `batch_edit_paragraph`); clone paragraphs and notebooks; create/export/import notebooks; modify paragraph config (charts, single or batch); run paragraphs (sync, batch, or async with status polling) and stop them; update form values; read/update permissions.
 
 **What MCP cannot do:** modify or delete `~Backups` notebooks (protected by the MCP server).
 
