@@ -256,10 +256,12 @@ If backup creation fails, the destructive operation is aborted — no data is lo
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `ValueError: ZEPPELIN_BASE_URL environment variable is required` | Missing env vars | Set all three env vars (`ZEPPELIN_BASE_URL`, `ZEPPELIN_USERNAME`, `ZEPPELIN_PASSWORD`) |
+| Tool error `ZEPPELIN_… not set` | Missing env vars | Set all three env vars (`ZEPPELIN_BASE_URL`, `ZEPPELIN_USERNAME`, `ZEPPELIN_PASSWORD`), then reconnect the server (`/mcp` in Claude Code) or restart the client |
 | `httpx.ConnectError` | Zeppelin is unreachable | Verify `ZEPPELIN_BASE_URL` is correct and Zeppelin is running |
-| Authentication error at startup | Wrong credentials | Check `ZEPPELIN_USERNAME` and `ZEPPELIN_PASSWORD` |
+| Tool error `Zeppelin rejected the login …` | Wrong credentials | Check `ZEPPELIN_USERNAME` and `ZEPPELIN_PASSWORD`, then reconnect the server or restart the client |
 | Tools don't appear in Claude Desktop | Config error or server crash | Check the MCP log files and verify `claude_desktop_config.json` syntax |
 | Tools don't appear in Claude Code | Server not registered | Run `claude mcp list` and re-add if missing |
 
-**Note:** The server automatically re-authenticates when sessions expire (including HTTP 302 redirects to the login page). You should not need to manually restart the server due to session timeouts.
+**Note:** The server starts even when credentials are missing or wrong, and logs in on the first tool call — configuration problems show up as tool errors rather than a server that fails to connect. Env vars are read once at startup, so after changing them the server must be restarted.
+
+The server also automatically re-authenticates when sessions expire (including HTTP 302 redirects to the login page). You should not need to manually restart the server due to session timeouts.
