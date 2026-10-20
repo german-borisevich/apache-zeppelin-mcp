@@ -855,14 +855,43 @@ class ZeppelinClient:
         self.password = password
         self.client = httpx.AsyncClient(timeout=30.0)
         self._authenticated = False
+        # Credentials come from env at process start and can't change afterwards,
+        # so a rejected login is remembered instead of re-sent on every tool call
+        # (which would also risk locking the account).
+        self._login_error: Optional[str] = None
+
+    def missing_config(self) -> list[str]:
+        return [
+            name for name, value in (
+                ("ZEPPELIN_BASE_URL", self.base_url),
+                ("ZEPPELIN_USERNAME", self.username),
+                ("ZEPPELIN_PASSWORD", self.password),
+            ) if not value
+        ]
 
     async def login(self) -> None:
+        missing = self.missing_config()
+        if missing:
+            raise ZeppelinAPIError(
+                f"{', '.join(missing)} not set. Set the environment variable(s), then "
+                "reconnect the zeppelin server via /mcp (or restart Claude Code)."
+            )
+        if self._login_error:
+            raise ZeppelinAPIError(self._login_error)
+
         self.client.cookies.clear()
         resp = await self.client.post(
             f"{self.base_url}/api/login",
             data={"userName": self.username, "password": self.password},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+        if resp.status_code in (401, 403):
+            self._login_error = (
+                f"Zeppelin rejected the login for user '{self.username}' "
+                f"(HTTP {resp.status_code}). Check ZEPPELIN_USERNAME / ZEPPELIN_PASSWORD, "
+                "then reconnect the zeppelin server via /mcp (or restart Claude Code)."
+            )
+            raise ZeppelinAPIError(self._login_error)
         resp.raise_for_status()
         self._authenticated = True
         logger.info("Authenticated with Zeppelin")
@@ -932,15 +961,15 @@ class AppContext:
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
-    if not ZEPPELIN_BASE_URL:
-        raise ValueError("ZEPPELIN_BASE_URL environment variable is required")
-    if not ZEPPELIN_USERNAME:
-        raise ValueError("ZEPPELIN_USERNAME environment variable is required")
-    if not ZEPPELIN_PASSWORD:
-        raise ValueError("ZEPPELIN_PASSWORD environment variable is required")
+    # Never fail startup: a server that exits during init shows up in the MCP
+    # client only as "Connection closed", with no hint at the cause. Missing or
+    # rejected credentials surface as tool errors instead (login is lazy, on
+    # the first request).
     client = ZeppelinClient(ZEPPELIN_BASE_URL, ZEPPELIN_USERNAME, ZEPPELIN_PASSWORD)
+    missing = client.missing_config()
+    if missing:
+        logger.warning("%s not set — tool calls will fail until configured", ", ".join(missing))
     try:
-        await client.login()
         yield AppContext(zeppelin=client)
     finally:
         await client.close()
